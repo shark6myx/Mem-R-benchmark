@@ -243,7 +243,7 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
 
     # 新增：创建结果保存目录（自动生成，不会重复）
     timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M")
-    output_dir = os.path.join(os.path.dirname(__file__), "sample_results")  # 结果存在这个文件夹
+    output_dir = os.path.join(os.path.dirname(__file__), "base_sample_results")  # 结果存在这个文件夹
     os.makedirs(output_dir, exist_ok=True)  # 自动创建文件夹，已有则不报错
 
 
@@ -263,7 +263,7 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
     results = []
 
     # 加速
-    start_sample_idx = 9  # 👉 要跑第1个sample就写0，第2个写1，...，第10个写9
+    start_sample_idx = 0  # 👉 要跑第1个sample就写0，第2个写1，...，第10个写9
     samples = [samples[start_sample_idx]]  # 强制只保留1个sample
     logger.info(f"只运行 1 个 sample：原始索引 {start_sample_idx}（第 {start_sample_idx + 1} 个样本）")
     logger.info(
@@ -327,9 +327,18 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
                 agent.memory_system.retriever = agent.memory_system.retriever.load(retriever_cache_file,
                                                                                    retriever_cache_embeddings_file)
             else:
-                print(f"No retriever cache found at {retriever_cache_file}, loading from memory")
-                agent.memory_system.retriever = agent.memory_system.retriever.load_from_local_memory(cached_memories,
-                                                                                                     'all-MiniLM-L6-v2')
+                # 没有完整缓存，检查是否有嵌入向量缓存
+                if os.path.exists(retriever_cache_embeddings_file):
+                    print(f"No retriever cache found, but found embeddings cache. Will reuse embeddings and only build BM25 index.")
+                    agent.memory_system.retriever = agent.memory_system.retriever.load_from_local_memory(
+                        cached_memories, 'all-MiniLM-L6-v2',
+                        agent.memory_system.retriever_alpha,
+                        embeddings_cache_file=retriever_cache_embeddings_file)
+                else:
+                    print(f"No retriever cache found at {retriever_cache_file}, loading from memory")
+                    agent.memory_system.retriever = agent.memory_system.retriever.load_from_local_memory(
+                        cached_memories, 'all-MiniLM-L6-v2',
+                        agent.memory_system.retriever_alpha)
             print(agent.memory_system.retriever.corpus)
             logger.info(f"Successfully loaded {len(cached_memories)} memories")
             # except Exception as e:
@@ -435,18 +444,14 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
     }
     logger.info(f"Error number: {error_num}")
 
-    # 自动生成：sample_results 文件夹下的对应文件名（和之前的 sample_result 对应）
+    # 自动生成：base_sample 文件夹下的对应文件名
     if not output_path:  # 如果没手动指定 --output，自动生成路径
-
-
-
 
         original_sample_idx = start_sample_idx  # 当前 sample 的原始索引（0-9）
 
-
         # 文件名格式：result_sample_XXX_final.json（XXX是原始索引）
-        output_filename = f"result_sample_{original_sample_idx}_final.json"
-        # 路径：sample_results 文件夹 + 自动生成的文件名
+        output_filename = f"base_result_sample_{original_sample_idx}_final.json"
+        # 路径：base_sample 文件夹 + 自动生成的文件名
         output_path = os.path.join(output_dir, output_filename)
     # Save results
     if output_path:
