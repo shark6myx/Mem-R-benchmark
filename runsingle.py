@@ -491,7 +491,7 @@ def main():
                         help="Backend to use (openai, ollama, or sglang)")
     parser.add_argument("--temperature_c5", type=float, default=0.5,
                         help="Temperature for the model")
-    parser.add_argument("--retrieve_k", type=int, default=10,
+    parser.add_argument("--retrieve_k", type=int, default=30,
                         help="Retrieve k")
     parser.add_argument("--sglang_host", type=str, default="http://localhost",
                         help="SGLang server host (for sglang backend)")

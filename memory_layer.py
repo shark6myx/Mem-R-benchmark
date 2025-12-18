@@ -71,7 +71,7 @@ class OpenAIController(BaseLLMController):
             from openai import OpenAI
             self.model = model
             if api_key is None:
-                api_key = "sk-uAe07b5a637f7595264de4f6def32a5c431a35d740ellO5J"
+                api_key = "sk-dxaeee451185337aec8ac82343fc46a73c5bf846cbf0wXWo"
             if api_key is None:
                 raise ValueError("OpenAI API key not found. Set OPENAI_API_KEY environment variable.")
             self.client = OpenAI(api_key=api_key,
@@ -404,7 +404,7 @@ class LLMController:
     def __init__(self, 
                  backend: Literal["openai", "ollama", "sglang"] = "openai",
                  model: str = "gpt-4", 
-                 api_key: Optional[str] = "sk-uAe07b5a637f7595264de4f6def32a5c431a35d740ellO5J",
+                 api_key: Optional[str] = "sk-dxaeee451185337aec8ac82343fc46a73c5bf846cbf0wXWo",
                  api_base: Optional[str] = None,
                  # sglang_host: str = "http://localhost",
                  # sglang_port: int = 30000
@@ -612,7 +612,7 @@ class HybridRetriever:
     结合BM25和语义搜索的检索器
     """
     
-    def __init__(self, model_name: str = 'all-MiniLM-L6-v2', alpha: float = 0.5):
+    def __init__(self, model_name: str = 'all-MiniLM-L6-v2', alpha: float = 0.65):
         """
         初始化混合检索器
         
@@ -992,7 +992,7 @@ class AgenticMemorySystem:
                  api_base: Optional[str] = None,
                  sglang_host: str = "http://localhost",
                  sglang_port: int = 30000,
-                 retriever_alpha: float = 0.5):
+                 retriever_alpha: float = 0.65):
         """
         初始化智能记忆系统
         
