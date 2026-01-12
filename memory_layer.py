@@ -2,7 +2,7 @@ from ast import Str
 from typing import Optional, Dict
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 import openai
-from typing import List, Dict, Optional, Literal, Any, Union
+from typing import List, Dict, Optional, Literal, Any, Union, Tuple
 import json
 from datetime import datetime
 import uuid
@@ -674,11 +674,15 @@ class HybridRetriever:
         # 加载pickle序列化的状态
         with open(retriever_cache_file, 'rb') as f:
             state = pickle.load(f)
+        
+        # 使用默认值，防止缺少键的情况
+        model_name = state.get('model_name', 'all-MiniLM-L6-v2')
+        alpha = state.get('alpha', 0.65)
             
         # 创建新实例
-        retriever = cls(model_name=state['model_name'], alpha=state['alpha'])
-        retriever.bm25 = state['bm25']
-        retriever.corpus = state['corpus']
+        retriever = cls(model_name=model_name, alpha=alpha)
+        retriever.bm25 = state.get('bm25')
+        retriever.corpus = state.get('corpus', [])
         retriever.document_ids = state.get('document_ids', {})
         
         # 如果存在嵌入向量文件，则从numpy文件加载
@@ -788,47 +792,73 @@ class HybridRetriever:
             self.bm25.add_document(tokenized_doc)
         
         # 更新嵌入向量
-        doc_embedding = self.model.encode([document], convert_to_tensor=True)
+        # 修复：使用 numpy 进行拼接，避免 tensor 类型不匹配错误
+        doc_embedding = self.model.encode([document])
         if self.embeddings is None:
             self.embeddings = doc_embedding
         else:
-            self.embeddings = torch.cat([self.embeddings, doc_embedding])
+            self.embeddings = np.vstack([self.embeddings, doc_embedding])
             
         return True
         
-    def retrieve(self, query: str, k: int = 5) -> List[int]:
+    def retrieve(self, query: str, k: int = 5, return_scores: bool = False) -> Union[List[int], Tuple[List[int], List[float]]]:
         """
         使用混合评分检索文档
         
         参数:
             query: 查询文本
             k: 返回的文档数量
+            return_scores: 是否返回分数
             
         返回:
-            相关文档的索引列表
+            相关文档的索引列表，如果return_scores=True，则返回(索引列表, 分数列表)
         """
         if not self.corpus:
-            return []
-            
+            return ([] if not return_scores else ([], []))
+        
+        # 如果 BM25 索引不存在但语料库存在，重新构建 BM25 索引
+        if self.bm25 is None and len(self.corpus) > 0:
+            tokenized_docs = [doc.lower().split() for doc in self.corpus]
+            self.bm25 = BM25Okapi(tokenized_docs)
+        
         # 获取BM25得分
         tokenized_query = query.lower().split()
-        bm25_scores = np.array(self.bm25.get_scores(tokenized_query))
         
-        # 如果存在BM25得分，则进行归一化
-        if len(bm25_scores) > 0:
-            bm25_scores = (bm25_scores - bm25_scores.min()) / (bm25_scores.max() - bm25_scores.min() + 1e-6)
-        
-        # 获取语义得分
-        query_embedding = self.model.encode([query])[0]
-        semantic_scores = cosine_similarity([query_embedding], self.embeddings)[0]
-        
-        # 组合得分
-        hybrid_scores = self.alpha * bm25_scores + (1 - self.alpha) * semantic_scores
+        # 如果 BM25 仍然为 None（语料库为空），只使用语义搜索
+        if self.bm25 is None:
+            # 只使用语义得分
+            if self.embeddings is None:
+                return ([] if not return_scores else ([], []))
+            query_embedding = self.model.encode([query])[0]
+            semantic_scores = cosine_similarity([query_embedding], self.embeddings)[0]
+            hybrid_scores = semantic_scores
+        else:
+            bm25_scores = np.array(self.bm25.get_scores(tokenized_query))
+            
+            # 如果存在BM25得分，则进行归一化
+            if len(bm25_scores) > 0:
+                bm25_scores = (bm25_scores - bm25_scores.min()) / (bm25_scores.max() - bm25_scores.min() + 1e-6)
+            
+            # 获取语义得分
+            if self.embeddings is None:
+                # 如果没有嵌入向量，只使用 BM25
+                hybrid_scores = bm25_scores
+            else:
+                query_embedding = self.model.encode([query])[0]
+                semantic_scores = cosine_similarity([query_embedding], self.embeddings)[0]
+                
+                # 组合得分
+                hybrid_scores = self.alpha * bm25_scores + (1 - self.alpha) * semantic_scores
         
         # 获取前k个索引
         k = min(k, len(self.corpus))
         top_k_indices = np.argsort(hybrid_scores)[-k:][::-1]
-        return top_k_indices.tolist()
+        
+        if return_scores:
+            top_k_scores = hybrid_scores[top_k_indices]
+            return top_k_indices.tolist(), top_k_scores.tolist()
+        else:
+            return top_k_indices.tolist()
 
 class SimpleEmbeddingRetriever:
     """
@@ -992,7 +1022,8 @@ class AgenticMemorySystem:
                  api_base: Optional[str] = None,
                  sglang_host: str = "http://localhost",
                  sglang_port: int = 30000,
-                 retriever_alpha: float = 0.65):
+                 retriever_alpha: float = 0.65,
+                 use_reranking: bool = True):
         """
         初始化智能记忆系统
         
@@ -1006,11 +1037,15 @@ class AgenticMemorySystem:
             sglang_host: SGLang服务器主机（可选）
             sglang_port: SGLang服务器端口（可选）
             retriever_alpha: 混合检索器中BM25和语义得分的权重（0 = 仅BM25，1 = 仅语义搜索）
+            use_reranking: 是否启用重排序（使用CrossEncoder提升检索精度）
         """
         self.memories = {}  # id -> MemoryNote
         self.retriever_alpha = retriever_alpha
         self.retriever = HybridRetriever(model_name, alpha=retriever_alpha)
         self.llm_controller = LLMController(llm_backend, llm_model, api_key, api_base)
+        # 重排序相关
+        self.use_reranking = use_reranking
+        self.reranker = None  # 延迟加载
         self.evolution_system_prompt = '''
                                 You are an AI memory evolution agent responsible for managing and evolving a knowledge base.
                                 Analyze the the new memory note according to keywords and context, also with their several nearest neighbors memory.
@@ -1110,7 +1145,15 @@ class AgenticMemorySystem:
         返回:
             (should_evolve, note) 元组，should_evolve表示是否需要演化
         """
-        neighbor_memory, indices = self.find_related_memories(note.content, k=5)
+        # 使用内部方法获取索引，避免解包错误
+        indices = self._retrieve_indices(note.content, k=5)
+        
+        # 构建邻居记忆字符串
+        all_memories = list(self.memories.values())
+        neighbor_memory = ""
+        for i in indices:
+            neighbor_memory += "memory index:" + str(i) + "\t talk start time:" + all_memories[i].timestamp + "\t memory content: " + all_memories[i].content + "\t memory context: " + all_memories[i].context + "\t memory keywords: " + str(all_memories[i].keywords) + "\t memory tags: " + str(all_memories[i].tags) + "\n"
+
         prompt_memory = self.evolution_system_prompt.format(context=note.context, content=note.content, keywords=note.keywords, nearest_neighbors_memories=neighbor_memory,neighbor_number=len(indices))
         print("prompt_memory", prompt_memory)
         response = self.llm_controller.llm.get_completion(
@@ -1214,61 +1257,210 @@ class AgenticMemorySystem:
                         self.memories[notes_id[memorytmp_idx]] = notetmp
         return should_evolve,note
 
-    def find_related_memories(self, query: str, k: int = 5) -> List[MemoryNote]:
+    def _get_reranker(self):
         """
-        使用混合检索查找相关记忆
+        延迟加载重排序器（CrossEncoder）
         
-        参数:
-            query: 查询文本
-            k: 返回的相关记忆数量
-            
         返回:
-            (memory_str, indices) 元组，memory_str是格式化后的记忆字符串，indices是记忆索引列表
+            CrossEncoder实例，如果不可用则返回None
         """
-        if not self.memories:
-            return "",[]
-            
-        # 获取相关记忆的索引
-        indices = self.retriever.retrieve(query, k)
-        
-        # 转换为记忆列表
-        all_memories = list(self.memories.values())
-        memory_str = ""
-        # print("indices", indices)
-        # print("all_memories", all_memories)
-        for i in indices:
-            memory_str += "memory index:" + str(i) + "\t talk start time:" + all_memories[i].timestamp + "\t memory content: " + all_memories[i].content + "\t memory context: " + all_memories[i].context + "\t memory keywords: " + str(all_memories[i].keywords) + "\t memory tags: " + str(all_memories[i].tags) + "\n"
-        return memory_str, indices
+        if self.reranker is None and self.use_reranking:
+            try:
+                from sentence_transformers import CrossEncoder
+                # 使用轻量级的交叉编码器模型
+                self.reranker = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+                print("✓ 重排序器（CrossEncoder）已加载")
+            except ImportError:
+                print("⚠ Warning: CrossEncoder not available, reranking disabled")
+                self.use_reranking = False
+            except Exception as e:
+                print(f"⚠ Warning: Failed to load reranker: {e}, reranking disabled")
+                self.use_reranking = False
+        return self.reranker
 
-    def find_related_memories_raw(self, query: str, k: int = 5) -> List[MemoryNote]:
+    def rerank_memories(self, query: str, retrieved_indices: List[int], k: int = 5) -> List[int]:
         """
-        使用混合检索查找相关记忆（包含邻居记忆）
+        对检索结果进行重排序，使用CrossEncoder提升精度
         
         参数:
             query: 查询文本
-            k: 返回的相关记忆数量
+            retrieved_indices: 第一轮检索得到的索引列表
+            k: 最终返回的数量
+        
+        返回:
+            重排序后的索引列表
+        """
+        if not self.use_reranking or len(retrieved_indices) <= k:
+            return retrieved_indices[:k]
+        
+        reranker = self._get_reranker()
+        if reranker is None:
+            return retrieved_indices[:k]
+        
+        all_memories = list(self.memories.values())
+        
+        # 构建查询-文档对
+        pairs = []
+        for idx in retrieved_indices:
+            mem = all_memories[idx]
+            # 构建文档文本（用于重排序）
+            # 优化顺序：关键词 + 标签 + 内容 + 上下文（确保关键元数据不被截断）
+            doc_text = f"{', '.join(mem.keywords)} , {', '.join(mem.tags)} , {mem.content} , {mem.context}"
+            pairs.append([query, doc_text])
+        
+        # 使用交叉编码器评分（更精确但更慢）
+        try:
+            scores = reranker.predict(pairs)
+            # 按分数排序（分数越高越相关）
+            ranked_indices = [retrieved_indices[i] for i in np.argsort(scores)[::-1]]
+            return ranked_indices[:k]
+        except Exception as e:
+            print(f"⚠ Warning: Reranking failed: {e}, using original order")
+            return retrieved_indices[:k]
+
+    def expand_and_rerank(self, query: str, initial_indices: List[int], initial_scores: List[float], k: int) -> List[int]:
+        """
+        链接感知检索与部分重排序策略
+        
+        参数:
+            query: 查询文本
+            initial_indices: 初始检索的种子索引列表
+            initial_scores: 初始检索的分数列表
+            k: 目标返回数量
             
         返回:
-            格式化后的记忆字符串，包含邻居记忆的信息
+            最终排序后的索引列表
+        """
+        # 参数配置
+        use_link_expansion = getattr(self, 'use_link_expansion', True)
+        link_weight_gamma = getattr(self, 'link_weight_gamma', 0.5)
+        max_expanded = k * 3
+        
+        all_memories = list(self.memories.values())
+        
+        # 1. 锁定安全区 (Safe Zone) - Top k/2
+        safe_k = k // 2
+        safe_indices = initial_indices[:safe_k]
+        
+        # 2. 候选扩展 (Candidate Expansion)
+        # 以 Top k 为种子进行扩展
+        seed_indices = initial_indices
+        candidate_pool = set()
+        candidate_scores = {}  # index -> score
+        
+        # 先加入剩余的种子 (k/2 ~ k)
+        for idx, score in zip(initial_indices[safe_k:], initial_scores[safe_k:]):
+            candidate_pool.add(idx)
+            candidate_scores[idx] = score
+            
+        # 扩展邻居
+        if use_link_expansion:
+            for idx, seed_score in zip(initial_indices, initial_scores):
+                if len(candidate_pool) >= max_expanded:
+                    break
+                    
+                neighborhood = all_memories[idx].links
+                for neighbor_idx in neighborhood:
+                    if neighbor_idx not in candidate_pool and neighbor_idx not in safe_indices:
+                        candidate_pool.add(neighbor_idx)
+                        # 邻居分数计算：继承种子的分数并衰减
+                        # 链接加权逻辑：Score = SeedScore * decay
+                        # 如果已存在（被其他种子扩展到），取最大值
+                        decay = 0.8
+                        link_score = seed_score * decay
+                        # 这里的 link_score 实际上是作为 base_score
+                        # 用户提到的 gamma * link_score 可以在这里体现
+                        # 简化处理：直接给予一个基于连接强度的分数
+                        
+                        current_score = candidate_scores.get(neighbor_idx, -1.0)
+                        if link_score > current_score:
+                            candidate_scores[neighbor_idx] = link_score
+        
+        # 将池子转换为列表以便排序
+        pool_list = list(candidate_pool)
+        
+        # 3. 链接加权排序 (Link Weighting Sort)
+        # 根据 heuristic score 对池子进行初步排序/截断
+        # 这里的 candidate_scores 已经是包含链接权重的分数的
+        pool_list.sort(key=lambda x: candidate_scores.get(x, 0.0), reverse=True)
+        
+        # 截断池子大小，避免重排序开销过大
+        pool_list = pool_list[:max_expanded]
+        
+        # 4. 部分重排序 (Partial Reranking)
+        reranker = self._get_reranker()
+        if self.use_reranking and reranker is not None:
+            pairs = []
+            for idx in pool_list:
+                mem = all_memories[idx]
+                # 输入格式优化：关键词 + 标签 + 内容 + 上下文
+                doc_text = f"{', '.join(mem.keywords)} , {', '.join(mem.tags)} , {mem.content} , {mem.context}"
+                pairs.append([query, doc_text])
+            
+            try:
+                scores = reranker.predict(pairs)
+                # 根据 CrossEncoder 分数重新排序池子
+                ranked_pool_indices = [pool_list[i] for i in np.argsort(scores)[::-1]]
+                pool_list = ranked_pool_indices
+            except Exception as e:
+                print(f"⚠ Warning: Partial reranking failed: {e}, using heuristic order")
+        
+        # 5. 结果融合 (Result Merge)
+        # 最终结果 = 安全区 + 重排后的池子头部
+        final_indices = safe_indices + pool_list
+        
+        # 截断到 k
+        return final_indices[:k]
+
+    def _retrieve_indices(self, query: str, k: int = 5) -> List[int]:
+        """
+        内部辅助方法：获取相关记忆的索引
         """
         if not self.memories:
             return []
             
-        # 获取相关记忆的索引
-        indices = self.retriever.retrieve(query, k)
+        # 第一步：初始检索
+        initial_k = k 
+        initial_indices, initial_scores = self.retriever.retrieve(query, initial_k, return_scores=True)
         
-        # 转换为记忆列表
+        # 第二步：扩展与重排序
+        if self.use_reranking:
+             indices = self.expand_and_rerank(query, initial_indices, initial_scores, k)
+        else:
+             indices = initial_indices
+             
+        return indices
+
+    def find_related_memories(self, query: str, k: int = 5) -> List[MemoryNote]:
+        """
+        使用混合检索查找相关记忆
+        返回记忆对象列表
+        """
+        indices = self._retrieve_indices(query, k)
+        all_memories = list(self.memories.values())
+        return [all_memories[i] for i in indices]
+
+    def find_related_memories_raw(self, query: str, k: int = 5) -> str:
+        """
+        使用混合检索查找相关记忆（包含邻居记忆）
+        返回格式化的字符串
+        """
+        indices = self._retrieve_indices(query, k)
+        
+        # 第三步：转换为记忆列表并格式化
         all_memories = list(self.memories.values())
         memory_str = ""
-        j = 0
+        total_neighbors_added = 0
+        
         for i in indices:
             memory_str +=  "talk start time:" + all_memories[i].timestamp + "memory content: " + all_memories[i].content + "memory context: " + all_memories[i].context + "memory keywords: " + str(all_memories[i].keywords) + "memory tags: " + str(all_memories[i].tags) + "\n"
             neighborhood = all_memories[i].links
             for neighbor in neighborhood:
-                memory_str += "talk start time:" + all_memories[neighbor].timestamp + "memory content: " + all_memories[neighbor].content + "memory context: " + all_memories[neighbor].context + "memory keywords: " + str(all_memories[neighbor].keywords) + "memory tags: " + str(all_memories[neighbor].tags) + "\n"
-                if j >=k:
+                if total_neighbors_added >= k:
                     break
-                j += 1
+                memory_str += "talk start time:" + all_memories[neighbor].timestamp + "memory content: " + all_memories[neighbor].content + "memory context: " + all_memories[neighbor].context + "memory keywords: " + str(all_memories[neighbor].keywords) + "memory tags: " + str(all_memories[neighbor].tags) + "\n"
+                total_neighbors_added += 1
+                
         return memory_str
 
 def run_tests():

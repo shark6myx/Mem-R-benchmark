@@ -27,6 +27,7 @@ def find_result_files(base_dir: str = ".") -> list:
     search_dirs = [
         base_path / "base_sample_results",
         base_path / "sample_results",
+        base_path / "reranking_sample_results",
         base_path
     ]
     

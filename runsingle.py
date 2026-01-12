@@ -58,7 +58,11 @@ class advancedMemAgent:
     def add_memory(self, content, time=None):
         self.memory_system.add_note(content, time=time)
 
-    def retrieve_memory(self, content, k=10):
+    # def retrieve_memory(self, content, k=10):
+    #     return self.memory_system.find_related_memories_raw(content, k=k)
+    def retrieve_memory(self, content, k=None):
+        if k is None:
+            k = self.retrieve_k
         return self.memory_system.find_related_memories_raw(content, k=k)
 
     def retrieve_memory_llm(self, memories_text, query):
@@ -243,7 +247,7 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
 
     # 新增：创建结果保存目录（自动生成，不会重复）
     timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M")
-    output_dir = os.path.join(os.path.dirname(__file__), "base_sample_results")  # 结果存在这个文件夹
+    output_dir = os.path.join(os.path.dirname(__file__), "reranking_sample_results")  # 结果存在这个文件夹
     os.makedirs(output_dir, exist_ok=True)  # 自动创建文件夹，已有则不报错
 
 
@@ -263,7 +267,7 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
     results = []
 
     # 加速
-    start_sample_idx = 0  # 👉 要跑第1个sample就写0，第2个写1，...，第10个写9
+    start_sample_idx = 9  # 👉 要跑第1个sample就写0，第2个写1，...，第10个写9
     samples = [samples[start_sample_idx]]  # 强制只保留1个sample
     logger.info(f"只运行 1 个 sample：原始索引 {start_sample_idx}（第 {start_sample_idx + 1} 个样本）")
     logger.info(
@@ -379,9 +383,31 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
                 try:
                     prediction = json.loads(prediction)["answer"]
                 except:
-                    prediction = prediction
-                    logger.info(f"Failed to parse prediction as JSON: {prediction}")
-                    error_num += 1
+                    # 增强的JSON解析和兜底逻辑
+                    import re
+                    # 1. 尝试清洗 Markdown 标记
+                    clean_prediction = prediction.strip()
+                    if clean_prediction.startswith("```json"):
+                        clean_prediction = clean_prediction[7:]
+                    elif clean_prediction.startswith("```"):
+                        clean_prediction = clean_prediction[3:]
+                    if clean_prediction.endswith("```"):
+                        clean_prediction = clean_prediction[:-3]
+                    clean_prediction = clean_prediction.strip()
+
+                    try:
+                        # 2. 尝试解析清洗后的 JSON
+                        prediction = json.loads(clean_prediction)["answer"]
+                    except:
+                        # 3. 尝试正则提取
+                        match = re.search(r'"answer":\s*"(.*?)"', clean_prediction)
+                        if match:
+                            prediction = match.group(1)
+                        else:
+                            # 4. 彻底失败，使用清洗后的文本作为答案
+                            prediction = clean_prediction
+                            logger.info(f"Failed to parse prediction as JSON: {prediction}")
+                            error_num += 1
                 # Log results
                 logger.info(f"\nQuestion {total_questions}: {qa.question}")
                 logger.info(f"Prediction: {prediction}")
@@ -418,7 +444,7 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
 
         # 新增：保存当前Sample的独立结果文件
         original_sample_idx = start_sample_idx + sample_idx  # 用原始索引命名（避免分多次跑时文件名重复）
-        sample_output_file = os.path.join(output_dir, f"result_sample_{original_sample_idx}.json")
+        sample_output_file = os.path.join(output_dir, f"reranking_result_sample_{original_sample_idx}.json")
         with open(sample_output_file, 'w', encoding='utf-8') as f:
             json.dump({
                 "sample_idx": original_sample_idx,  # 样本原始索引（0-9）
@@ -450,7 +476,7 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
         original_sample_idx = start_sample_idx  # 当前 sample 的原始索引（0-9）
 
         # 文件名格式：result_sample_XXX_final.json（XXX是原始索引）
-        output_filename = f"base_result_sample_{original_sample_idx}_final.json"
+        output_filename = f"reranking_result_sample_{original_sample_idx}_final.json"
         # 路径：base_sample 文件夹 + 自动生成的文件名
         output_path = os.path.join(output_dir, output_filename)
     # Save results
@@ -491,7 +517,7 @@ def main():
                         help="Backend to use (openai, ollama, or sglang)")
     parser.add_argument("--temperature_c5", type=float, default=0.5,
                         help="Temperature for the model")
-    parser.add_argument("--retrieve_k", type=int, default=30,
+    parser.add_argument("--retrieve_k", type=int, default=40,
                         help="Retrieve k")
     parser.add_argument("--sglang_host", type=str, default="http://localhost",
                         help="SGLang server host (for sglang backend)")
