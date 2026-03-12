@@ -41,7 +41,7 @@ class advancedMemAgent:
     # def __init__(self, model, backend, retrieve_k, temperature_c5, sglang_host="http://localhost", sglang_port=30000):
     def __init__(self, model, backend, retrieve_k, temperature_c5):
         self.memory_system = AgenticMemorySystem(
-            model_name='all-MiniLM-L6-v2',
+            model_name='BAAI/bge-m3',
             llm_backend=backend,
             llm_model=model,
 
@@ -63,7 +63,8 @@ class advancedMemAgent:
     def retrieve_memory(self, content, k=None):
         if k is None:
             k = self.retrieve_k
-        return self.memory_system.find_related_memories_raw(content, k=k)
+        # 激活 GraphRAG 的社区感知检索！
+        return self.memory_system.find_related_memories_with_community(content, k=k)
 
     def retrieve_memory_llm(self, memories_text, query):
         prompt = f"""Given the following conversation memories and a question, select the most relevant parts of the conversation that would help answer the question. Include the date/time if available.
@@ -316,57 +317,93 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
             memories_dir,
             f"retriever_cache_embeddings_sample_{original_sample_idx}.npy"
         )
-        # Check if cached memories exist
-        if os.path.exists(memory_cache_file):
-            logger.info(f"Loading cached memories for sample {start_sample_idx}")
-            # try:
-            with open(memory_cache_file, 'rb') as f:
-                cached_memories = pickle.load(f)
-            # Restore memories to agent
-            agent.memory_system.memories = cached_memories
-            if os.path.exists(retriever_cache_file):
-                print(f"Found retriever cache files:")
-                print(f"  - Retriever cache: {retriever_cache_file}")
-                print(f"  - Embeddings cache: {retriever_cache_embeddings_file}")
-                agent.memory_system.retriever = agent.memory_system.retriever.load(retriever_cache_file,
-                                                                                   retriever_cache_embeddings_file)
-            else:
-                # 没有完整缓存，检查是否有嵌入向量缓存
-                if os.path.exists(retriever_cache_embeddings_file):
-                    print(f"No retriever cache found, but found embeddings cache. Will reuse embeddings and only build BM25 index.")
-                    agent.memory_system.retriever = agent.memory_system.retriever.load_from_local_memory(
-                        cached_memories, 'all-MiniLM-L6-v2',
-                        agent.memory_system.retriever_alpha,
-                        embeddings_cache_file=retriever_cache_embeddings_file)
-                else:
-                    print(f"No retriever cache found at {retriever_cache_file}, loading from memory")
-                    agent.memory_system.retriever = agent.memory_system.retriever.load_from_local_memory(
-                        cached_memories, 'all-MiniLM-L6-v2',
-                        agent.memory_system.retriever_alpha)
-            print(agent.memory_system.retriever.corpus)
-            logger.info(f"Successfully loaded {len(cached_memories)} memories")
-            # except Exception as e:
-            #     logger.info(f"Error loading cached memories: {e}. Will recreate memories.")
-            #     cached_memories = None
-        else:
-            logger.info(f"No cached memories found for sample {sample_idx}. Creating new memories.")
-            cached_memories = None
+        # ── 持久化记忆加载 / 重建逻辑 ─────────────────────────────────────
+        # 策略：检测缓存是否为含新字段（community_id）的新格式
+        #       新格式 → 直接加载并恢复完整 GraphRAG 状态
+        #       旧格式或无缓存 → 重新构建并保存
+        # ─────────────────────────────────────────────────────────────────
+        def _is_new_format(mem_dict: dict) -> bool:
+            """检查 pickle 里的 MemoryNote 是否含新字段"""
+            if not mem_dict:
+                return False
+            sample = next(iter(mem_dict.values()))
+            return hasattr(sample, 'community_id') and hasattr(sample, 'id_based_links')
 
+        cache_loaded = False
+        if os.path.exists(memory_cache_file):
+            try:
+                with open(memory_cache_file, 'rb') as f:
+                    cached_memories = pickle.load(f)
+
+                if _is_new_format(cached_memories):
+                    # ── 新格式：完整恢复 ──────────────────────────────
+                    logger.info(f"✅ 检测到新格式缓存，加载 {len(cached_memories)} 条记忆...")
+                    agent.memory_system.memories = cached_memories
+                    agent.memory_system.note_total_count = len(cached_memories)
+
+                    # 恢复检索器（优先用完整缓存，其次只用 embeddings）
+                    if os.path.exists(retriever_cache_file):
+                        agent.memory_system.retriever = agent.memory_system.retriever.load(
+                            retriever_cache_file, retriever_cache_embeddings_file
+                        )
+                    elif os.path.exists(retriever_cache_embeddings_file):
+                        agent.memory_system.retriever = \
+                            agent.memory_system.retriever.load_from_local_memory(
+                                cached_memories, 'BAAI/bge-m3',
+                                agent.memory_system.retriever_alpha,
+                                embeddings_cache_file=retriever_cache_embeddings_file
+                            )
+                    else:
+                        agent.memory_system.retriever = \
+                            agent.memory_system.retriever.load_from_local_memory(
+                                cached_memories, 'BAAI/bge-m3',
+                                agent.memory_system.retriever_alpha
+                            )
+
+                    # 恢复 GraphRAG 图边 + 社区状态
+                    graph_cache_dir = os.path.join(memories_dir, f"graph_state_sample_{original_sample_idx}")
+                    if os.path.exists(graph_cache_dir):
+                        agent.memory_system.load_graph(graph_cache_dir)
+                        logger.info(f"✅ GraphRAG 图状态已恢复（"
+                                    f"{len(agent.memory_system.graph_edges)} 条边，"
+                                    f"{len(agent.memory_system.communities)} 个社区）")
+                    else:
+                        # 没有图状态缓存，基于已有记忆重建社区
+                        logger.info("⚠ 无图状态缓存，基于现有记忆重建社区...")
+                        agent.memory_system.rebuild_communities()
+
+                    cache_loaded = True
+                else:
+                    logger.info("⚠ 检测到旧格式缓存（缺少新字段），忽略，将重新构建记忆")
+            except Exception as e:
+                logger.info(f"⚠ 加载缓存失败：{e}，将重新构建记忆")
+
+        if not cache_loaded:
+            # ── 重新构建：逐条 add_note，触发实时演化 + 社区聚类 ─────
+            logger.info(f"🔄 重新构建记忆（sample {original_sample_idx}）...")
             for _, turns in sample.conversation.sessions.items():
                 for turn in turns.turns:
                     turn_datatime = turns.date_time
                     conversation_tmp = "Speaker " + turn.speaker + "says : " + turn.text
                     agent.add_memory(conversation_tmp, time=turn_datatime)
-                    # break
-                #     i +=1
-                #     if i>2:
-                #         break
-                # break
+
+            # 同步计数（add_note 已自增，这里做最终校正）
+            agent.memory_system.note_total_count = len(agent.memory_system.memories)
+
+            # 最后触发一次完整社区重建（确保所有记忆都已纳入）
+            if len(agent.memory_system.memories) >= 2:
+                agent.memory_system.rebuild_communities()
+
+            # ── 保存全量状态（memories + retriever + graph）────────────
             memories_to_cache = agent.memory_system.memories
             with open(memory_cache_file, 'wb') as f:
                 pickle.dump(memories_to_cache, f)
             agent.memory_system.retriever.save(retriever_cache_file, retriever_cache_embeddings_file)
-            logger.info(f"\nSuccessfully cached {len(memories_to_cache)} memories")
+            graph_cache_dir = os.path.join(memories_dir, f"graph_state_sample_{original_sample_idx}")
+            agent.memory_system.save_graph(graph_cache_dir)
+            logger.info(f"✅ 已缓存 {len(memories_to_cache)} 条记忆 + GraphRAG 图状态 → {memories_dir}")
+        # ─────────────────────────────────────────────────────────────────
+
 
         logger.info(f"\nProcessing sample {sample_idx + 1}/{len(samples)}")
 

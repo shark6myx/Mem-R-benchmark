@@ -22,5 +22,9 @@ pandas==2.2.3
 pathlib==1.0.1
 python-dotenv==1.0.1
 
+# GraphRAG community clustering
+networkx>=3.0          # Graph data structure for community detection
+python-louvain>=0.16   # Louvain community detection algorithm (pip install python-louvain)
+
 # Optional dependencies
 pytorch-cuda==2.4.0  # Only if using CUDA

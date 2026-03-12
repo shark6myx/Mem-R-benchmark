@@ -4,6 +4,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 import openai
 from typing import List, Dict, Optional, Literal, Any, Union, Tuple
 import json
+from dataclasses import dataclass, field
 from datetime import datetime
 import uuid
 from rank_bm25 import BM25Okapi
@@ -500,6 +501,9 @@ class MemoryNote:
         self.evolution_history = evolution_history or []
         self.category = category or "Uncategorized"
         self.tags = tags or []
+        # GraphRAG: community membership and stable id-based links
+        self.community_id: Optional[str] = None
+        self.id_based_links: List[str] = []  # stores note.id strings (not position indices)
 
     @staticmethod
     def analyze_content(content: str, llm_controller: LLMController) -> Dict:
@@ -605,6 +609,48 @@ class MemoryNote:
                 "tags": []
             }
 
+@dataclass
+class CommunitySummary:
+    """
+    GraphRAG 社区摘要单元
+    
+    代表一组语义相关的 MemoryNote 聚类，由 LLM 生成高层摘要，
+    供 Global Search 使用。
+    """
+    community_id: str
+    level: int                              # 0=细粒度层级
+    member_note_ids: List[str]             # 隶属 note 的 id 列表
+    title: str = ""                         # LLM 生成的主题标题（≤20字）
+    summary: str = ""                       # LLM 生成的综合摘要（≤200字）
+    keywords: List[str] = field(default_factory=list)
+    embedding: Optional[Any] = None         # summary 的向量（np.ndarray）
+    updated_at: str = ""
+
+    def to_dict(self) -> dict:
+        """序列化（不含 embedding，embedding 单独存）"""
+        return {
+            "community_id": self.community_id,
+            "level": self.level,
+            "member_note_ids": self.member_note_ids,
+            "title": self.title,
+            "summary": self.summary,
+            "keywords": self.keywords,
+            "updated_at": self.updated_at,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "CommunitySummary":
+        return cls(
+            community_id=d["community_id"],
+            level=d.get("level", 0),
+            member_note_ids=d.get("member_note_ids", []),
+            title=d.get("title", ""),
+            summary=d.get("summary", ""),
+            keywords=d.get("keywords", []),
+            updated_at=d.get("updated_at", ""),
+        )
+
+
 class HybridRetriever:
     """
     混合检索系统
@@ -612,7 +658,7 @@ class HybridRetriever:
     结合BM25和语义搜索的检索器
     """
     
-    def __init__(self, model_name: str = 'all-MiniLM-L6-v2', alpha: float = 0.65):
+    def __init__(self, model_name: str = 'BAAI/bge-m3', alpha: float = 0.65):
         """
         初始化混合检索器
         
@@ -647,7 +693,7 @@ class HybridRetriever:
             'bm25': self.bm25,
             'corpus': self.corpus,
             'document_ids': self.document_ids,
-            'model_name': 'all-MiniLM-L6-v2'  # 模型名称的默认值
+            'model_name': 'BAAI/bge-m3'  # 模型名称的默认值
         }
         
         # 尝试获取实际的模型名称（如果可能）
@@ -676,7 +722,7 @@ class HybridRetriever:
             state = pickle.load(f)
         
         # 使用默认值，防止缺少键的情况
-        model_name = state.get('model_name', 'all-MiniLM-L6-v2')
+        model_name = state.get('model_name', 'BAAI/bge-m3')
         alpha = state.get('alpha', 0.65)
             
         # 创建新实例
@@ -867,7 +913,7 @@ class SimpleEmbeddingRetriever:
     仅使用文本嵌入向量的检索器
     """
     
-    def __init__(self, model_name: str = 'all-MiniLM-L6-v2'):
+    def __init__(self, model_name: str = 'BAAI/bge-m3'):
         """
         初始化简单嵌入检索器
         
@@ -1014,7 +1060,7 @@ class AgenticMemorySystem:
     基于混合检索（BM25 + 语义搜索）的记忆管理系统
     """
     def __init__(self, 
-                 model_name: str = 'all-MiniLM-L6-v2',
+                 model_name: str = 'BAAI/bge-m3',
                  llm_backend: str = "openai",
                  llm_model: str = "gpt-4o-mini",
                  evo_threshold: int = 100,
@@ -1080,6 +1126,24 @@ class AgenticMemorySystem:
         self.evo_cnt = 0  # 演化计数器
         self.evo_threshold = evo_threshold  # 演化阈值
 
+        # ── GraphRAG 社区聚类（新增）──────────────────────────────────
+        # 图边列表：{src_id, tgt_id, weight, type}
+        self.graph_edges: List[dict] = []
+        # 社区摘要字典：community_id -> CommunitySummary
+        self.communities: Dict[str, CommunitySummary] = {}
+        # 社区 embedding 矩阵（与 community_ids_list 行对齐）
+        self.community_embeddings: Optional[np.ndarray] = None
+        self.community_ids_list: List[str] = []
+        # 触发全量重聚类的 note 新增数阈值
+        self.community_rebuild_interval: int = 50
+        # 已添加 note 计数（用于触发聚类）
+        self.note_total_count: int = 0
+        # 语义边阈值（cosine similarity）
+        self.edge_semantic_threshold: float = 0.70
+        # 关键词共现边阈值（Jaccard）
+        self.edge_jaccard_threshold: float = 0.20
+        # ────────────────────────────────────────────────────────────
+
     def add_note(self, content: str, time: str = None, **kwargs) -> str:
         """
         添加新的记忆笔记
@@ -1104,6 +1168,14 @@ class AgenticMemorySystem:
             self.evo_cnt += 1
             if self.evo_cnt % self.evo_threshold == 0:
                 self.consolidate_memories()
+
+        # ── GraphRAG：构建图边 + 触发社区重聚类 ─────────────────────
+        self._build_edges_for_new_note(note)
+        self.note_total_count += 1
+        if self.note_total_count % self.community_rebuild_interval == 0:
+            self.rebuild_communities()
+        # ────────────────────────────────────────────────────────────
+
         return note.id
     
     def consolidate_memories(self):
@@ -1134,6 +1206,11 @@ class AgenticMemorySystem:
         # 一次性添加所有文档（HybridRetriever的add_documents会重新初始化索引）
         if all_docs:
             self.retriever.add_documents(all_docs)
+
+        # ── GraphRAG：同步重建社区 ──────────────────────────────────────
+        if len(self.memories) >= 5:
+            self.rebuild_communities()
+        # ────────────────────────────────────────────────────────────────
     
     def process_memory(self, note: MemoryNote) -> bool:
         """
@@ -1462,6 +1539,492 @@ class AgenticMemorySystem:
                 total_neighbors_added += 1
                 
         return memory_str
+
+    # ══════════════════════════════════════════════════════════════════════
+    # ██  GraphRAG 社区聚类方法（新增）
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _build_edges_for_new_note(self, note: MemoryNote) -> None:
+        """
+        为新加入的 note 自动构建三类图边：
+          1. semantic  : 语义 cosine 相似度 ≥ edge_semantic_threshold
+          2. temporal  : timestamp 前缀相同（同一 session）且连续
+          3. entity_shared : 关键词 Jaccard 相似度 ≥ edge_jaccard_threshold
+
+        构建完成后，同时更新 note.id_based_links（双向）。
+        """
+        if not self.memories:
+            return
+
+        # 获取新 note 的嵌入向量（直接用检索器已经 encode 过的最后一条）
+        # 由于 add_note 在调用此函数前已经 retriever.add_document，
+        # 最后一个嵌入就是新 note 的向量
+        if self.retriever.embeddings is None or len(self.retriever.embeddings) == 0:
+            return
+
+        new_emb = self.retriever.embeddings[-1].reshape(1, -1)   # shape (1, D)
+
+        existing_notes = list(self.memories.values())
+        # 不包含刚加入的那条（self.memories 在此之前已写入）
+        # 但 note 此时已在 self.memories 中，所以要排除自身
+        existing_notes = [n for n in existing_notes if n.id != note.id]
+
+        if not existing_notes:
+            return
+
+        # ── 1. 语义边 ──────────────────────────────────────────────────
+        # 从检索器的 document_ids 映射中获取各 note 的 embedding 行索引
+        # 这样即使 consolidate_memories() 重建了检索器，对齐关系也始终正确
+        if self.retriever.embeddings is not None and self.retriever.embeddings.shape[0] > 1:
+            for prev_note in existing_notes:
+                # 查找该 note 对应的检索器文档 key（与 add_note 写入格式一致）
+                prev_doc_key = (
+                    "content:" + prev_note.content
+                    + " context:" + prev_note.context
+                    + " keywords: " + ", ".join(prev_note.keywords)
+                    + " tags: " + ", ".join(prev_note.tags)
+                )
+                prev_idx = self.retriever.document_ids.get(prev_doc_key)
+                if prev_idx is None:
+                    continue   # 该 note 在检索器中找不到，跳过
+                prev_emb = self.retriever.embeddings[prev_idx].reshape(1, -1)
+                sim = float(cosine_similarity(new_emb, prev_emb)[0][0])
+                if sim >= self.edge_semantic_threshold:
+                    self.graph_edges.append({
+                        "src_id": note.id,
+                        "tgt_id": prev_note.id,
+                        "weight": round(sim, 4),
+                        "type": "semantic"
+                    })
+                    if prev_note.id not in note.id_based_links:
+                        note.id_based_links.append(prev_note.id)
+                    if note.id not in prev_note.id_based_links:
+                        prev_note.id_based_links.append(note.id)
+
+        # ── 2. 时序边（同 session 内相邻两条） ──────────────────────────
+        # timestamp 格式为 YYYYMMDDHHmm，取前8位作为 session key（同一天）
+        new_session = note.timestamp[:8] if note.timestamp else ""
+        for prev_note in existing_notes[-5:]:   # 只看最近5条，够用且高效
+            prev_session = prev_note.timestamp[:8] if prev_note.timestamp else ""
+            if new_session and prev_session and new_session == prev_session:
+                self.graph_edges.append({
+                    "src_id": prev_note.id,
+                    "tgt_id": note.id,
+                    "weight": 0.6,
+                    "type": "temporal"
+                })
+                if note.id not in prev_note.id_based_links:
+                    prev_note.id_based_links.append(note.id)
+                if prev_note.id not in note.id_based_links:
+                    note.id_based_links.append(prev_note.id)
+
+        # ── 3. 关键词共现边（Jaccard）──────────────────────────────────
+        new_kw_set = set(k.lower() for k in note.keywords)
+        if new_kw_set:
+            for prev_note in existing_notes:
+                prev_kw_set = set(k.lower() for k in prev_note.keywords)
+                if not prev_kw_set:
+                    continue
+                intersection = len(new_kw_set & prev_kw_set)
+                union = len(new_kw_set | prev_kw_set)
+                jaccard = intersection / union if union > 0 else 0.0
+                if jaccard >= self.edge_jaccard_threshold:
+                    self.graph_edges.append({
+                        "src_id": note.id,
+                        "tgt_id": prev_note.id,
+                        "weight": round(jaccard, 4),
+                        "type": "entity_shared"
+                    })
+                    if prev_note.id not in note.id_based_links:
+                        note.id_based_links.append(prev_note.id)
+                    if note.id not in prev_note.id_based_links:
+                        prev_note.id_based_links.append(note.id)
+
+        # ── 4. LLM evolution 产生的 strengthen links → id_based_links ──
+        # process_memory 写入了 note.links（位置索引），这里同步转 id
+        # （process_memory 在此函数调用前已执行，self.memories 已含新 note）
+        all_ids = list(self.memories.keys())
+        for pos_idx in note.links:
+            if isinstance(pos_idx, int) and 0 <= pos_idx < len(all_ids):
+                linked_id = all_ids[pos_idx]
+                if linked_id != note.id and linked_id not in note.id_based_links:
+                    note.id_based_links.append(linked_id)
+                    self.graph_edges.append({
+                        "src_id": note.id,
+                        "tgt_id": linked_id,
+                        "weight": 0.8,
+                        "type": "llm_inferred"
+                    })
+
+    def _build_networkx_graph(self):
+        """
+        将 self.graph_edges 转成 networkx 无向加权图，供社区检测使用。
+
+        返回:
+            nx.Graph 对象
+        """
+        try:
+            import networkx as nx
+        except ImportError:
+            raise ImportError("networkx 未安装，请运行: pip install networkx")
+
+        G = nx.Graph()
+        # 添加所有 note 节点
+        for note_id in self.memories:
+            G.add_node(note_id)
+
+        # 添加边（同向去重，取最大权重）
+        edge_map: Dict[Tuple[str, str], float] = {}
+        for e in self.graph_edges:
+            src, tgt, w = e["src_id"], e["tgt_id"], e["weight"]
+            if src not in self.memories or tgt not in self.memories:
+                continue
+            key = (min(src, tgt), max(src, tgt))
+            edge_map[key] = max(edge_map.get(key, 0.0), w)
+
+        for (src, tgt), w in edge_map.items():
+            G.add_edge(src, tgt, weight=w)
+
+        return G
+
+    def _run_community_detection(self, G) -> Dict[str, int]:
+        """
+        在图 G 上运行 Louvain 社区检测。
+
+        参数:
+            G: networkx.Graph 对象
+
+        返回:
+            {note_id: community_int} 映射字典
+        """
+        try:
+            import community as community_louvain
+        except ImportError:
+            raise ImportError(
+                "python-louvain 未安装，请运行: pip install python-louvain"
+            )
+
+        if len(G.nodes) == 0:
+            return {}
+
+        # 孤立节点（无边）也可被 Louvain 分配到单独社区
+        # 注意：python-louvain 的 best_partition 不支持 random_state 参数
+        partition = community_louvain.best_partition(G, weight="weight")
+        return partition   # {node_id_str: community_int}
+
+    def _generate_community_summary(
+        self, community_id: str, member_ids: List[str]
+    ) -> CommunitySummary:
+        """
+        调用 LLM 为一个社区生成主题标题、摘要和关键词。
+
+        参数:
+            community_id: 社区 ID 字符串
+            member_ids: 该社区内所有 note 的 id 列表
+
+        返回:
+            CommunitySummary 对象
+        """
+        members = [self.memories[mid] for mid in member_ids if mid in self.memories]
+        if not members:
+            return CommunitySummary(
+                community_id=community_id, level=0, member_note_ids=member_ids
+            )
+
+        # 构造 Prompt 内容
+        notes_text = ""
+        for m in members[:20]:   # 最多取前20条避免超 context
+            notes_text += (
+                f"[{m.timestamp}] {m.content} "
+                f"(keywords: {', '.join(m.keywords[:5])})\n"
+            )
+
+        prompt = f"""你是一个记忆聚类分析专家。以下是属于同一主题聚类的 {len(members)} 条记忆片段：
+
+{notes_text}
+
+请综合分析这组记忆，生成：
+1. title：一句话概括核心主题（≤20字）
+2. summary：对这组记忆的综合描述（≤200字），涵盖主要事件、实体、时间线
+3. keywords：5-10个代表性关键词列表
+
+以JSON格式返回：{{"title": "...", "summary": "...", "keywords": [...]}}"""
+
+        response_format = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "community_summary",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "title":    {"type": "string"},
+                        "summary":  {"type": "string"},
+                        "keywords": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["title", "summary", "keywords"],
+                    "additionalProperties": False,
+                },
+                "strict": True,
+            },
+        }
+
+        title, summary, keywords = "", "", []
+        try:
+            raw = self.llm_controller.llm.get_completion(prompt, response_format=response_format)
+            raw_clean = raw.strip()
+            if not raw_clean.startswith("{"):
+                raw_clean = raw_clean[raw_clean.find("{"):]
+            if not raw_clean.endswith("}"):
+                raw_clean = raw_clean[: raw_clean.rfind("}") + 1]
+            parsed = json.loads(raw_clean)
+            title = parsed.get("title", "")
+            summary = parsed.get("summary", "")
+            keywords = parsed.get("keywords", [])
+        except Exception as e:
+            print(f"⚠ 社区摘要生成失败 ({community_id}): {e}")
+
+        # 对摘要文本生成 embedding
+        embedding = None
+        if summary:
+            try:
+                embedding = self.retriever.model.encode([summary])[0]
+            except Exception as e:
+                print(f"⚠ 社区 embedding 生成失败: {e}")
+
+        return CommunitySummary(
+            community_id=community_id,
+            level=0,
+            member_note_ids=member_ids,
+            title=title,
+            summary=summary,
+            keywords=keywords,
+            embedding=embedding,
+            updated_at=datetime.now().strftime("%Y%m%d%H%M"),
+        )
+
+    def rebuild_communities(self) -> None:
+        """
+        GraphRAG 社区重建：
+          1. 构建 networkx 图
+          2. 运行 Louvain 社区检测
+          3. 为每个社区生成 LLM 摘要
+          4. 更新 self.communities 和 community_embeddings
+
+        会自动更新每条 note 的 community_id 字段。
+        """
+        if len(self.memories) < 2:
+            return
+
+        print(f"🔄 GraphRAG: 重建社区（共 {len(self.memories)} 条记忆）...")
+
+        # Step 1: 建图
+        try:
+            G = self._build_networkx_graph()
+        except ImportError as e:
+            print(f"⚠ {e}，跳过社区重建")
+            return
+
+        # Step 2: 社区检测
+        try:
+            partition = self._run_community_detection(G)   # {note_id: int}
+        except ImportError as e:
+            print(f"⚠ {e}，跳过社区重建")
+            return
+
+        if not partition:
+            return
+
+        # Step 3: 按社区 id 分组
+        community_groups: Dict[int, List[str]] = {}
+        for note_id, comm_int in partition.items():
+            community_groups.setdefault(comm_int, []).append(note_id)
+
+        # Step 4: 为每个社区生成摘要
+        new_communities: Dict[str, CommunitySummary] = {}
+        all_embeddings = []
+        cid_order = []
+
+        for comm_int, member_ids in community_groups.items():
+            community_id = f"comm_{comm_int:04d}"
+
+            # 更新 note.community_id
+            for mid in member_ids:
+                if mid in self.memories:
+                    self.memories[mid].community_id = community_id
+
+            # 生成摘要
+            cs = self._generate_community_summary(community_id, member_ids)
+            new_communities[community_id] = cs
+
+            if cs.embedding is not None:
+                all_embeddings.append(cs.embedding)
+                cid_order.append(community_id)
+
+        # Step 5: 更新类属性
+        self.communities = new_communities
+        self.community_ids_list = cid_order
+        if all_embeddings:
+            self.community_embeddings = np.stack(all_embeddings, axis=0)
+        else:
+            self.community_embeddings = None
+
+        print(
+            f"✅ GraphRAG: 社区重建完成，共 {len(new_communities)} 个社区："
+        )
+        for cid, cs in new_communities.items():
+            print(f"   [{cid}] {cs.title} ({len(cs.member_note_ids)} 条记忆)")
+
+    def find_community_context(self, query: str, k: int = 3) -> List[CommunitySummary]:
+        """
+        Global Search：对查询，检索最相关的 Top-K 社区摘要。
+        适合回答宏观问题，如"我们都讨论过哪些话题"。
+
+        参数:
+            query: 查询文本
+            k: 返回的社区数量
+
+        返回:
+            CommunitySummary 列表（按相关性降序）
+        """
+        if not self.communities or self.community_embeddings is None:
+            return []
+
+        query_emb = self.retriever.model.encode([query])   # shape (1, D)
+        sims = cosine_similarity(query_emb, self.community_embeddings)[0]
+
+        k = min(k, len(self.community_ids_list))
+        top_indices = np.argsort(sims)[-k:][::-1]
+
+        return [
+            self.communities[self.community_ids_list[i]]
+            for i in top_indices
+            if self.community_ids_list[i] in self.communities
+        ]
+
+    def find_related_memories_with_community(
+        self, query: str, k: int = 5
+    ) -> Dict[str, Any]:
+        """
+        Local Search 增强版：检索最相关的 notes，并附带其所属社区的摘要作为背景。
+        原有 find_related_memories() 接口不变，此为新增增强入口。
+
+        参数:
+            query: 查询文本
+            k: 返回的 note 数量
+
+        返回:
+            字典，包含：
+              - notes: List[MemoryNote]  相关记忆列表
+              - community_context: str   社区摘要背景（格式化字符串）
+              - communities: List[CommunitySummary]  涉及的社区列表
+        """
+        # Step 1: 原生 Local Search
+        indices = self._retrieve_indices(query, k)
+        all_memories = list(self.memories.values())
+        related_notes = [all_memories[i] for i in indices if i < len(all_memories)]
+
+        # Step 2: 收集这些 notes 涉及的社区
+        involved_community_ids = set()
+        for note in related_notes:
+            if note.community_id and note.community_id in self.communities:
+                involved_community_ids.add(note.community_id)
+
+        involved_communities = [
+            self.communities[cid] for cid in involved_community_ids
+        ]
+
+        # Step 3: 格式化社区背景
+        community_context = ""
+        for cs in involved_communities:
+            community_context += (
+                f"【{cs.title}】{cs.summary} "
+                f"(涉及关键词: {', '.join(cs.keywords[:5])})\n"
+            )
+
+        return {
+            "notes": related_notes,
+            "community_context": community_context.strip(),
+            "communities": involved_communities,
+        }
+
+    def save_graph(self, save_dir: str) -> None:
+        """
+        持久化 GraphRAG 状态：图边、社区摘要、社区 embeddings。
+
+        参数:
+            save_dir: 保存目录路径（会自动创建）
+        """
+        Path(save_dir).mkdir(parents=True, exist_ok=True)
+
+        # 保存图边列表
+        edges_path = Path(save_dir) / "graph_edges.json"
+        with open(edges_path, "w", encoding="utf-8") as f:
+            json.dump(self.graph_edges, f, ensure_ascii=False, indent=2)
+
+        # 保存社区摘要（不含 embedding）
+        communities_path = Path(save_dir) / "communities.json"
+        with open(communities_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {cid: cs.to_dict() for cid, cs in self.communities.items()},
+                f, ensure_ascii=False, indent=2
+            )
+
+        # 保存社区 embeddings
+        if self.community_embeddings is not None:
+            emb_path = Path(save_dir) / "community_embeddings.npy"
+            np.save(str(emb_path), self.community_embeddings)
+
+        # 保存 community_ids_list
+        meta_path = Path(save_dir) / "graph_meta.json"
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump({"community_ids_list": self.community_ids_list}, f)
+
+        print(f"✅ GraphRAG 状态已保存到 {save_dir}")
+
+    def load_graph(self, save_dir: str) -> None:
+        """
+        从磁盘加载 GraphRAG 状态。
+
+        参数:
+            save_dir: 保存目录路径
+        """
+        save_path = Path(save_dir)
+
+        # 加载图边
+        edges_path = save_path / "graph_edges.json"
+        if edges_path.exists():
+            with open(edges_path, "r", encoding="utf-8") as f:
+                self.graph_edges = json.load(f)
+
+        # 加载社区摘要
+        communities_path = save_path / "communities.json"
+        if communities_path.exists():
+            with open(communities_path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            self.communities = {
+                cid: CommunitySummary.from_dict(d) for cid, d in raw.items()
+            }
+
+        # 加载社区 embeddings
+        emb_path = save_path / "community_embeddings.npy"
+        if emb_path.exists():
+            self.community_embeddings = np.load(str(emb_path))
+
+        # 加载 meta
+        meta_path = save_path / "graph_meta.json"
+        if meta_path.exists():
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            self.community_ids_list = meta.get("community_ids_list", [])
+
+        print(
+            f"✅ GraphRAG 状态已加载："
+            f"{len(self.graph_edges)} 条边，{len(self.communities)} 个社区"
+        )
+
+    # ══════════════════════════════════════════════════════════════════════
+    # ██  GraphRAG 方法结束
+    # ══════════════════════════════════════════════════════════════════════
 
 def run_tests():
     """
