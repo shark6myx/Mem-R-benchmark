@@ -1,20 +1,15 @@
-from ast import Str
-from typing import Optional, Dict
+from typing import Optional, Dict, List, Literal, Any, Union, Tuple
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 import openai
-from typing import List, Dict, Optional, Literal, Any, Union, Tuple
 import json
 from dataclasses import dataclass, field
 from datetime import datetime
 import uuid
-from rank_bm25 import BM25Okapi
 from sentence_transformers import SentenceTransformer
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 import os
 from abc import ABC, abstractmethod
-from transformers import AutoModel, AutoTokenizer
-from nltk.tokenize import word_tokenize
 import pickle
 from pathlib import Path
 from litellm import completion
@@ -22,18 +17,6 @@ import requests
 import json as json_lib
 import time
 import torch
-
-def simple_tokenize(text):
-    """
-    简单的文本分词函数
-    
-    参数:
-        text: 待分词的文本字符串
-        
-    返回:
-        分词后的单词列表
-    """
-    return word_tokenize(text)
 
 class BaseLLMController(ABC):
     """
@@ -766,11 +749,11 @@ class HybridRetriever:
                     retriever.embeddings = cached_embeddings
                     retriever.document_ids = {doc: idx for idx, doc in enumerate(all_docs)}
                     
-                    # 只构建BM25索引
-                    tokenized_docs = [doc.lower().split() for doc in all_docs]
-                    retriever.bm25 = BM25Okapi(tokenized_docs)
+                    # 根据升级计划弃用 BM25
+                    # tokenized_docs = [doc.lower().split() for doc in all_docs]
+                    # retriever.bm25 = BM25Okapi(tokenized_docs)
                     
-                    print(f"✓ 成功复用已有嵌入向量缓存，仅构建BM25索引")
+                    print(f"✓ 成功复用已有嵌入向量缓存")
                     return retriever
                 else:
                     print(f"⚠ 嵌入向量数量不匹配（缓存: {len(cached_embeddings)}, 文档: {len(all_docs)}），将重新生成")
@@ -794,9 +777,9 @@ class HybridRetriever:
         if not documents:
             return
             
-        # 为BM25进行分词
-        tokenized_docs = [doc.lower().split() for doc in documents]
-        self.bm25 = BM25Okapi(tokenized_docs)
+        # 为BM25进行分词 (弃用)
+        # tokenized_docs = [doc.lower().split() for doc in documents]
+        # self.bm25 = BM25Okapi(tokenized_docs)
         
         # 创建嵌入向量
         self.embeddings = self.model.encode(documents)
@@ -827,15 +810,13 @@ class HybridRetriever:
         self.corpus.append(document)
         self.document_ids[document] = doc_idx
         
-        # 更新BM25
-        if self.bm25 is None:
-            # 第一个文档，初始化BM25
-            tokenized_corpus = [simple_tokenize(document)]
-            self.bm25 = BM25Okapi(tokenized_corpus)
-        else:
-            # 添加到现有BM25
-            tokenized_doc = simple_tokenize(document)
-            self.bm25.add_document(tokenized_doc)
+        # 更新BM25 (弃用)
+        # if self.bm25 is None:
+        #     tokenized_corpus = [simple_tokenize(document)]
+        #     self.bm25 = BM25Okapi(tokenized_corpus)
+        # else:
+        #     tokenized_doc = simple_tokenize(document)
+        #     self.bm25.add_document(tokenized_doc)
         
         # 更新嵌入向量
         # 修复：使用 numpy 进行拼接，避免 tensor 类型不匹配错误
@@ -862,39 +843,11 @@ class HybridRetriever:
         if not self.corpus:
             return ([] if not return_scores else ([], []))
         
-        # 如果 BM25 索引不存在但语料库存在，重新构建 BM25 索引
-        if self.bm25 is None and len(self.corpus) > 0:
-            tokenized_docs = [doc.lower().split() for doc in self.corpus]
-            self.bm25 = BM25Okapi(tokenized_docs)
-        
-        # 获取BM25得分
-        tokenized_query = query.lower().split()
-        
-        # 如果 BM25 仍然为 None（语料库为空），只使用语义搜索
-        if self.bm25 is None:
-            # 只使用语义得分
-            if self.embeddings is None:
-                return ([] if not return_scores else ([], []))
-            query_embedding = self.model.encode([query])[0]
-            semantic_scores = cosine_similarity([query_embedding], self.embeddings)[0]
-            hybrid_scores = semantic_scores
-        else:
-            bm25_scores = np.array(self.bm25.get_scores(tokenized_query))
-            
-            # 如果存在BM25得分，则进行归一化
-            if len(bm25_scores) > 0:
-                bm25_scores = (bm25_scores - bm25_scores.min()) / (bm25_scores.max() - bm25_scores.min() + 1e-6)
-            
-            # 获取语义得分
-            if self.embeddings is None:
-                # 如果没有嵌入向量，只使用 BM25
-                hybrid_scores = bm25_scores
-            else:
-                query_embedding = self.model.encode([query])[0]
-                semantic_scores = cosine_similarity([query_embedding], self.embeddings)[0]
-                
-                # 组合得分
-                hybrid_scores = self.alpha * bm25_scores + (1 - self.alpha) * semantic_scores
+        # BM25 已弃用，始终走纯 Dense 语义路径
+        if self.embeddings is None:
+            return ([] if not return_scores else ([], []))
+        query_embedding = self.model.encode([query])[0]
+        hybrid_scores = cosine_similarity([query_embedding], self.embeddings)[0]
         
         # 获取前k个索引
         k = min(k, len(self.corpus))
@@ -906,152 +859,204 @@ class HybridRetriever:
         else:
             return top_k_indices.tolist()
 
-class SimpleEmbeddingRetriever:
-    """
-    简单嵌入检索系统
-    
-    仅使用文本嵌入向量的检索器
-    """
-    
-    def __init__(self, model_name: str = 'BAAI/bge-m3'):
+    def get_scores_by_emb(self, query_embedding: np.ndarray) -> np.ndarray:
         """
-        初始化简单嵌入检索器
-        
-        参数:
-            model_name: 使用的SentenceTransformer模型名称
-        """
-        self.model = SentenceTransformer(model_name)
-        self.corpus = []
-        self.embeddings = None
-        self.document_ids = {}  # 文档内容到索引的映射
-        
-    def add_documents(self, documents: List[str]):
-        """
-        向检索器添加文档
-        
-        参数:
-            documents: 文档文本列表
-        """
-        # 如果没有现有文档，则重置
-        if not self.corpus:
-            self.corpus = documents
-            # print("documents", documents, len(documents))
-            self.embeddings = self.model.encode(documents)
-            self.document_ids = {doc: idx for idx, doc in enumerate(documents)}
-        else:
-            # 追加新文档
-            start_idx = len(self.corpus)
-            self.corpus.extend(documents)
-            new_embeddings = self.model.encode(documents)
-            if self.embeddings is None:
-                self.embeddings = new_embeddings
-            else:
-                self.embeddings = np.vstack([self.embeddings, new_embeddings])
-            for idx, doc in enumerate(documents):
-                self.document_ids[doc] = start_idx + idx
-    
-    def search(self, query: str, k: int = 5) -> List[Dict[str, float]]:
-        """
-        使用余弦相似度搜索相似文档
-        
-        参数:
-            query: 查询文本
-            k: 返回的结果数量
-            
-        返回:
-            文档索引列表
-        """
-        if not self.corpus:
-            return []
-        # print("corpus", len(self.corpus), self.corpus)
-        # 编码查询
-        query_embedding = self.model.encode([query])[0]
-        
-        # 计算余弦相似度
-        similarities = cosine_similarity([query_embedding], self.embeddings)[0]
-        # 获取前k个结果
-        top_k_indices = np.argsort(similarities)[-k:][::-1]
-        
-            
-        return top_k_indices
-        
-    def save(self, retriever_cache_file: str, retriever_cache_embeddings_file: str):
-        """
-        将检索器状态保存到磁盘
-        
-        参数:
-            retriever_cache_file: 检索器缓存文件路径
-            retriever_cache_embeddings_file: 嵌入向量缓存文件路径
-        """
-        # 使用numpy保存嵌入向量
-        if self.embeddings is not None:
-            np.save(retriever_cache_embeddings_file, self.embeddings)
-        
-        # 保存其他属性
-        state = {
-            'corpus': self.corpus,
-            'document_ids': self.document_ids
-        }
-        with open(retriever_cache_file, 'wb') as f:
-            pickle.dump(state, f)
-    
-    def load(self, retriever_cache_file: str, retriever_cache_embeddings_file: str):
-        """
-        从磁盘加载检索器状态
-        
-        参数:
-            retriever_cache_file: 检索器缓存文件路径
-            retriever_cache_embeddings_file: 嵌入向量缓存文件路径
-            
-        返回:
-            self，以便链式调用
-        """
-        print(f"Loading retriever from {retriever_cache_file} and {retriever_cache_embeddings_file}")
-        
-        # 加载嵌入向量
-        if os.path.exists(retriever_cache_embeddings_file):
-            print(f"Loading embeddings from {retriever_cache_embeddings_file}")
-            self.embeddings = np.load(retriever_cache_embeddings_file)
-            print(f"Embeddings shape: {self.embeddings.shape}")
-        else:
-            print(f"Embeddings file not found: {retriever_cache_embeddings_file}")
-        
-        # 加载其他属性
-        if os.path.exists(retriever_cache_file):
-            print(f"Loading corpus from {retriever_cache_file}")
-            with open(retriever_cache_file, 'rb') as f:
-                state = pickle.load(f)
-                self.corpus = state['corpus']
-                self.document_ids = state['document_ids']
-                print(f"Loaded corpus with {len(self.corpus)} documents")
-        else:
-            print(f"Corpus file not found: {retriever_cache_file}")
-            
-        return self
+        [HyDE 支持方法] 直接接受预计算好的向量计算所有文档的余弦相似度分数。
+        由 find_related_memories_advanced 调用，传入 HyDE 生成的假设性回复的向量。
 
-    @classmethod
-    def load_from_local_memory(cls, memories: Dict, model_name: str) -> 'SimpleEmbeddingRetriever':
-        """
-        从内存中的记忆对象加载检索器状态
-        
         参数:
-            memories: 记忆字典
-            model_name: 使用的模型名称
-            
+            query_embedding: shape (D,) 的 numpy 向量
+
         返回:
-            创建的检索器实例
+            shape (N,) 的分数数组，每个元素对应语料库中的一个文档
         """
-        # 为每个记忆创建结合内容和元数据的文档
-        all_docs = []
-        for m in memories.values():
-            metadata_text = f"{m.context} {' '.join(m.keywords)} {' '.join(m.tags)}"
-            doc = f"{m.content} , {metadata_text}"
-            all_docs.append(doc)
+        if self.embeddings is None or len(self.corpus) == 0:
+            return np.array([])
+
+        embeddings_arr = np.array(self.embeddings)
+        norm_q = np.linalg.norm(query_embedding)
+        norm_e = np.linalg.norm(embeddings_arr, axis=1)
+        norm_e[norm_e == 0] = 1e-10
+        if norm_q == 0:
+            norm_q = 1e-10
+
+        return np.dot(embeddings_arr, query_embedding) / (norm_e * norm_q)
+
+
+
+class AgenticDecomposer:
+    """
+    代理式查询分解器 (Agentic Query Decomposer)
+    用于将复杂的多意图查询分解为多个原子级子查询。
+    附带核心意图(core intent)以防止分解出来的子问题产生语义偏离(retrieval drift)。
+    """
+    def __init__(self, llm_controller: LLMController):
+        self.llm_controller = llm_controller
+        self.system_prompt = '''You are an expert AI query decomposer.
+Your task is to break down complex user queries into smaller, independent atomic sub-queries that are easier to search in a vector database.
+You must also identify the "core_intent" of the original query to ensure no sub-query drifts away from the main topic.
+
+Output your response ONLY as a JSON object with this structure:
+{
+    "core_intent": "The main goal or topic",
+    "sub_queries": ["sub query 1", "sub query 2"]
+}
+'''
+
+    def decompose(self, query: str) -> dict:
+        """
+        分解问题为核心意图和独立的子问题。
+        """
+        try:
+            prompt = f"Decompose the following complex query:\n{query}"
             
-        # 创建并初始化检索器
-        retriever = cls(model_name)
-        retriever.add_documents(all_docs)
-        return retriever
+            response_format = {
+                "type": "json_schema", 
+                "json_schema": {
+                    "name": "decomposition",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "core_intent": {"type": "string"},
+                            "sub_queries": {
+                                "type": "array",
+                                "items": {"type": "string"}
+                            }
+                        },
+                        "required": ["core_intent", "sub_queries"],
+                        "additionalProperties": False
+                    },
+                    "strict": True
+                }
+            }
+            
+            response = self.llm_controller.llm.get_completion(
+                self.system_prompt + "\n" + prompt, 
+                response_format=response_format,
+                temperature=0.3
+            )
+            
+            # 基础 JSON 清理
+            clean_resp = response.strip()
+            if not clean_resp.startswith("{"):
+                clean_resp = clean_resp[clean_resp.find("{"):]
+            if not clean_resp.endswith("}"):
+                clean_resp = clean_resp[:clean_resp.rfind("}")+1]
+                
+            return json.loads(clean_resp)
+        except Exception as e:
+            print(f"⚠ Decomposition failed: {e}. Falling back to original query.")
+            return {"core_intent": query, "sub_queries": [query]}
+
+class ReflectionVerifier:
+    """
+    反思验证器 (Reflection Verifier)
+    用于在检索出片段后，使用反思令牌(<reflection>)验证片段的相关性；
+    并在最后验证所有搜集的证据是否构成针对核心意图的逻辑闭环。
+    """
+    def __init__(self, llm_controller: LLMController):
+        self.llm_controller = llm_controller
+
+    def verify_relevance(self, query: str, document: str) -> dict:
+        """
+        验证单个文档片段是否能够回答给定的问题。
+        引入 reflection 强制模型进行思考打分。
+        """
+        prompt = f"""Evaluate if the following document fragment is relevant to the search query.
+Query: {query}
+Document: {document}
+
+Before giving your final judgment, you MUST write your thought process inside a <reflection> tag.
+Then provide a boolean "is_relevant" score.
+
+Output as JSON:
+{{
+    "reflection": "<reflection> your thought process here </reflection>",
+    "is_relevant": true or false
+}}
+"""
+        response_format = {
+            "type": "json_schema", 
+            "json_schema": {
+                "name": "relevance_check",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "reflection": {"type": "string"},
+                        "is_relevant": {"type": "boolean"}
+                    },
+                    "required": ["reflection", "is_relevant"],
+                    "additionalProperties": False
+                },
+                "strict": True
+            }
+        }
+        
+        try:
+            response = self.llm_controller.llm.get_completion(prompt, response_format=response_format, temperature=0.1)
+            
+            clean_resp = response.strip()
+            if not clean_resp.startswith("{"):
+                clean_resp = clean_resp[clean_resp.find("{"):]
+            if not clean_resp.endswith("}"):
+                clean_resp = clean_resp[:clean_resp.rfind("}")+1]
+                
+            return json.loads(clean_resp)
+        except Exception as e:
+            print(f"⚠ Relevance reflection failed: {e}. Assuming true.")
+            return {"reflection": "<reflection> Error </reflection>", "is_relevant": True}
+
+    def verify_logical_closure(self, query: str, evidences: list) -> dict:
+        """
+        验证搜集到的所有证据是否能够针对核心意图形成逻辑闭环。
+        如果逻辑不完整，返回缺少的关键信息提示。
+        """
+        evidences_str = "\n".join([f"[{i+1}] {e}" for i, e in enumerate(evidences)])
+        prompt = f"""Evaluate if the following collected evidences form a complete logical closed loop to fully answer the main query.
+Query: {query}
+Evidences:
+{evidences_str}
+
+Consider: Is there any critical missing piece of information needed to form a complete answer?
+Write your thought inside <reflection> tag, and set "is_closed_loop" to true if sufficient, false otherwise.
+If false, populate "missing_information" with exactly what is missing.
+
+Output as JSON:
+{{
+    "reflection": "<reflection> thought </reflection>",
+    "is_closed_loop": true or false,
+    "missing_information": "what is missing, or empty string if true"
+}}
+"""
+        response_format = {
+            "type": "json_schema", 
+            "json_schema": {
+                "name": "closure_check",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "reflection": {"type": "string"},
+                        "is_closed_loop": {"type": "boolean"},
+                        "missing_information": {"type": "string"}
+                    },
+                    "required": ["reflection", "is_closed_loop", "missing_information"],
+                    "additionalProperties": False
+                },
+                "strict": True
+            }
+        }
+        
+        try:
+            response = self.llm_controller.llm.get_completion(prompt, response_format=response_format, temperature=0.2)
+            clean_resp = response.strip()
+            if not clean_resp.startswith("{"):
+                clean_resp = clean_resp[clean_resp.find("{"):]
+            if not clean_resp.endswith("}"):
+                clean_resp = clean_resp[:clean_resp.rfind("}")+1]
+            return json.loads(clean_resp)
+        except Exception as e:
+            print(f"⚠ Logical closure check failed: {e}. Assuming closed loop.")
+            return {"reflection": "<reflection> Error </reflection>", "is_closed_loop": True, "missing_information": ""}
 
 class AgenticMemorySystem:
     """
@@ -1395,100 +1400,6 @@ class AgenticMemorySystem:
             print(f"⚠ Warning: Reranking failed: {e}, using original order")
             return retrieved_indices[:k]
 
-    def expand_and_rerank(self, query: str, initial_indices: List[int], initial_scores: List[float], k: int) -> List[int]:
-        """
-        链接感知检索与部分重排序策略
-        
-        参数:
-            query: 查询文本
-            initial_indices: 初始检索的种子索引列表
-            initial_scores: 初始检索的分数列表
-            k: 目标返回数量
-            
-        返回:
-            最终排序后的索引列表
-        """
-        # 参数配置
-        use_link_expansion = getattr(self, 'use_link_expansion', True)
-        link_weight_gamma = getattr(self, 'link_weight_gamma', 0.5)
-        max_expanded = k * 3
-        
-        all_memories = list(self.memories.values())
-        
-        # 1. 锁定安全区 (Safe Zone) - Top k/2
-        safe_k = k // 2
-        safe_indices = initial_indices[:safe_k]
-        
-        # 2. 候选扩展 (Candidate Expansion)
-        # 以 Top k 为种子进行扩展
-        seed_indices = initial_indices
-        candidate_pool = set()
-        candidate_scores = {}  # index -> score
-        
-        # 先加入剩余的种子 (k/2 ~ k)
-        for idx, score in zip(initial_indices[safe_k:], initial_scores[safe_k:]):
-            candidate_pool.add(idx)
-            candidate_scores[idx] = score
-            
-        # 扩展邻居
-        if use_link_expansion:
-            for idx, seed_score in zip(initial_indices, initial_scores):
-                if len(candidate_pool) >= max_expanded:
-                    break
-                    
-                neighborhood = all_memories[idx].links
-                for neighbor_idx in neighborhood:
-                    if neighbor_idx not in candidate_pool and neighbor_idx not in safe_indices:
-                        candidate_pool.add(neighbor_idx)
-                        # 邻居分数计算：继承种子的分数并衰减
-                        # 链接加权逻辑：Score = SeedScore * decay
-                        # 如果已存在（被其他种子扩展到），取最大值
-                        decay = 0.8
-                        link_score = seed_score * decay
-                        # 这里的 link_score 实际上是作为 base_score
-                        # 用户提到的 gamma * link_score 可以在这里体现
-                        # 简化处理：直接给予一个基于连接强度的分数
-                        
-                        current_score = candidate_scores.get(neighbor_idx, -1.0)
-                        if link_score > current_score:
-                            candidate_scores[neighbor_idx] = link_score
-        
-        # 将池子转换为列表以便排序
-        pool_list = list(candidate_pool)
-        
-        # 3. 链接加权排序 (Link Weighting Sort)
-        # 根据 heuristic score 对池子进行初步排序/截断
-        # 这里的 candidate_scores 已经是包含链接权重的分数的
-        pool_list.sort(key=lambda x: candidate_scores.get(x, 0.0), reverse=True)
-        
-        # 截断池子大小，避免重排序开销过大
-        pool_list = pool_list[:max_expanded]
-        
-        # 4. 部分重排序 (Partial Reranking)
-        reranker = self._get_reranker()
-        if self.use_reranking and reranker is not None:
-            pairs = []
-            for idx in pool_list:
-                mem = all_memories[idx]
-                # 输入格式优化：关键词 + 标签 + 内容 + 上下文
-                doc_text = f"{', '.join(mem.keywords)} , {', '.join(mem.tags)} , {mem.content} , {mem.context}"
-                pairs.append([query, doc_text])
-            
-            try:
-                scores = reranker.predict(pairs)
-                # 根据 CrossEncoder 分数重新排序池子
-                ranked_pool_indices = [pool_list[i] for i in np.argsort(scores)[::-1]]
-                pool_list = ranked_pool_indices
-            except Exception as e:
-                print(f"⚠ Warning: Partial reranking failed: {e}, using heuristic order")
-        
-        # 5. 结果融合 (Result Merge)
-        # 最终结果 = 安全区 + 重排后的池子头部
-        final_indices = safe_indices + pool_list
-        
-        # 截断到 k
-        return final_indices[:k]
-
     def _retrieve_indices(self, query: str, k: int = 5) -> List[int]:
         """
         内部辅助方法：获取相关记忆的索引
@@ -1496,17 +1407,8 @@ class AgenticMemorySystem:
         if not self.memories:
             return []
             
-        # 第一步：初始检索
-        initial_k = k 
-        initial_indices, initial_scores = self.retriever.retrieve(query, initial_k, return_scores=True)
-        
-        # 第二步：扩展与重排序
-        if self.use_reranking:
-             indices = self.expand_and_rerank(query, initial_indices, initial_scores, k)
-        else:
-             indices = initial_indices
-             
-        return indices
+        initial_indices, initial_scores = self.retriever.retrieve(query, k, return_scores=True)
+        return initial_indices
 
     def find_related_memories(self, query: str, k: int = 5) -> List[MemoryNote]:
         """
@@ -1517,28 +1419,78 @@ class AgenticMemorySystem:
         all_memories = list(self.memories.values())
         return [all_memories[i] for i in indices]
 
-    def find_related_memories_raw(self, query: str, k: int = 5) -> str:
+
+
+    def agentic_retrieve(self, query: str, k: int = 5) -> str:
         """
-        使用混合检索查找相关记忆（包含邻居记忆）
-        返回格式化的字符串
+        基于 Agentic Decomposition 和 Reflection 的智能检索。
+        将复杂问题分治后独立检索并过滤。
         """
-        indices = self._retrieve_indices(query, k)
+        # 1. 初始化组件
+        decomposer = AgenticDecomposer(self.llm_controller)
+        verifier = ReflectionVerifier(self.llm_controller)
         
-        # 第三步：转换为记忆列表并格式化
-        all_memories = list(self.memories.values())
-        memory_str = ""
-        total_neighbors_added = 0
+        # 2. 任务分解
+        decomp_result = decomposer.decompose(query)
+        sub_queries = decomp_result.get("sub_queries", [query])
+        core_intent = decomp_result.get("core_intent", query)
         
-        for i in indices:
-            memory_str +=  "talk start time:" + all_memories[i].timestamp + "memory content: " + all_memories[i].content + "memory context: " + all_memories[i].context + "memory keywords: " + str(all_memories[i].keywords) + "memory tags: " + str(all_memories[i].tags) + "\n"
-            neighborhood = all_memories[i].links
-            for neighbor in neighborhood:
-                if total_neighbors_added >= k:
-                    break
-                memory_str += "talk start time:" + all_memories[neighbor].timestamp + "memory content: " + all_memories[neighbor].content + "memory context: " + all_memories[neighbor].context + "memory keywords: " + str(all_memories[neighbor].keywords) + "memory tags: " + str(all_memories[neighbor].tags) + "\n"
-                total_neighbors_added += 1
+        all_relevant_contexts = []
+        seen_documents = set()
+        
+        # 3. 定向检索与反思过滤
+        for sub_q in sub_queries:
+            # 加上核心意图，防止偏离
+            context_query = f"Intent: {core_intent} Sub-query: {sub_q}"
+            
+            # 使用升级版的超能漫游检索
+            advanced_result = self.find_related_memories_advanced(context_query, k=k)
+            raw_memories = advanced_result.get("notes", [])
+            
+            for mem in raw_memories:
+                doc_text = f"Content: {mem.content} Keywords: {mem.keywords}"
+                if doc_text in seen_documents:
+                    continue
+                seen_documents.add(doc_text)
                 
-        return memory_str
+                # 4. 反思节点相关性
+                rel_check = verifier.verify_relevance(sub_q, doc_text)
+                if rel_check.get("is_relevant", True):
+                    # 如果相关，则计入最终证据
+                    all_relevant_contexts.append(
+                        f"[Verified Evidence for '{sub_q}'] {doc_text}\n"
+                        f"Reflection: {rel_check.get('reflection', '')}"
+                    )
+        
+        # 如果全部被过滤掉（非常极端），回退到基础检索
+        if not all_relevant_contexts:
+            print("⚠ Reflection filtered out all results. Falling back to simple retrieval.")
+            fallback_memories = self.find_related_memories(query, k=k)
+            for mem in fallback_memories:
+                all_relevant_contexts.append(f"[Fallback Evidence] {mem.content} Keywords: {mem.keywords}")
+            
+        # 5. 验证假设文档的逻辑闭环
+        closure_check = verifier.verify_logical_closure(query, all_relevant_contexts)
+        
+        # 如果逻辑非闭环，尝试用缺失信息进行二次补充检索 (Anti-drift Follow-up)
+        if not closure_check.get("is_closed_loop", True):
+            missing_info = closure_check.get("missing_information", "")
+            print(f"↻ Logical loop incomplete. Missing: {missing_info}. Triggering follow-up retrieval...")
+            followup_query = f"Intent: {core_intent} Missing: {missing_info}"
+            followup_result = self.find_related_memories_advanced(followup_query, k=2)
+            followup_memories = followup_result.get("notes", [])
+            
+            for mem in followup_memories:
+                doc_text = f"Content: {mem.content} Keywords: {mem.keywords}"
+                if doc_text not in seen_documents:
+                    seen_documents.add(doc_text)
+                    all_relevant_contexts.append(
+                        f"[Follow-up Evidence for '{missing_info}'] {doc_text}\n"
+                        f"Reflection: <reflection> Retrieved to resolve logical gap </reflection>"
+                    )
+            
+        final_context = "\n---\n".join(all_relevant_contexts)
+        return final_context
 
     # ══════════════════════════════════════════════════════════════════════
     # ██  GraphRAG 社区聚类方法（新增）
@@ -1947,6 +1899,171 @@ class AgenticMemorySystem:
             "communities": involved_communities,
         }
 
+    # ══════════════════════════════════════════════════════════════════════
+    # ██  检索升级增强模块：HyDE + 社区感知 + PPR 多跳
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _generate_hyde_query(self, query: str) -> str:
+        """
+        [HyDE] 生成假设性回复
+        用原始提问生成一个拟真的假答案，将问句转为陈述句，以对抗 Dense 检索时的 Query-Doc 不对称性。
+        """
+        prompt = f"""You are an AI generating hypothetical documents.
+The user is asking a question about a technical discussion or memory log. 
+Please write 1 to 2 sentences of a plausible answer to this question. Do not state that you don't know. Just guess a highly realistic, plausible answer that contains relevant terminology.
+
+User Query: {query}
+
+Output JUST the hypothetical answer text, nothing else."""
+        try:
+            hyde_doc = self.llm_controller.llm.get_completion(
+                prompt,
+                response_format={"type": "text"},
+                temperature=0.7
+            )
+            return hyde_doc.strip()
+        except Exception as e:
+            print(f"⚠ HyDE generation failed: {e}. Falling back to original query.")
+            return query
+
+    def _community_filter(self, query_emb: np.ndarray, top_c: int = 2) -> set:
+        """
+        [Community Filter] 层级检索：先定位 Top 社区
+        返回命中社区内的 member_note_ids 集合。
+        """
+        if not self.communities or self.community_embeddings is None:
+            return None
+            
+        sims = cosine_similarity(query_emb, self.community_embeddings)[0]
+        k = min(top_c, len(self.community_ids_list))
+        top_indices = np.argsort(sims)[-k:][::-1]
+        
+        target_ids = set()
+        for i in top_indices:
+            cid = self.community_ids_list[i]
+            if cid in self.communities:
+                for mid in self.communities[cid].member_note_ids:
+                    target_ids.add(mid)
+                    
+        return target_ids
+
+    def _ppr_walk(self, seed_ids: list, damping: float = 0.8, max_hops: int = 2) -> dict:
+        """
+        [PPR Multi-hop] 个性化页面排名（多跳漫游）
+        从种子节点出发，利用 semantic, temporal, Jaccard 图边扩展隐藏线索。
+        """
+        from collections import defaultdict
+        scores = defaultdict(float)
+        
+        # 种子节点初始分数
+        for sid in seed_ids:
+            scores[sid] = 1.0
+            
+        # 预加载无向图邻接表
+        adj = defaultdict(lambda: defaultdict(float))
+        for edge in self.graph_edges:
+            src, tgt, w = edge.get("src_id"), edge.get("tgt_id"), edge.get("weight", 0.1)
+            # 无向图，保存最大权重
+            adj[src][tgt] = max(adj[src][tgt], w)
+            adj[tgt][src] = max(adj[tgt][src], w)
+            
+        current_frontier = set(seed_ids)
+        for hop in range(1, max_hops + 1):
+            next_frontier = set()
+            for node in current_frontier:
+                current_score = scores[node]
+                for neighbor, weight in adj[node].items():
+                    # 传播得分: 节点现有得分 * 边权重 * 衰减率
+                    propagated = current_score * float(weight) * damping
+                    if propagated > scores[neighbor]:
+                        scores[neighbor] = propagated
+                        next_frontier.add(neighbor)
+            current_frontier = next_frontier
+            
+        return dict(scores)
+
+    def find_related_memories_advanced(self, query: str, k: int = 5) -> Dict[str, Any]:
+        """
+        终极检索演进管道：HyDE + Community Filter + BGE-M3 + PPR Walk
+        返回含有丰富线索组合的综合证据字典。
+        完全兼容原有的返回结构。
+        """
+        all_memories_list = list(self.memories.values())
+        if not all_memories_list:
+             return {"notes": [], "community_context": "", "communities": []}
+             
+        # 1. HyDE
+        hyde_doc = self._generate_hyde_query(query)
+        
+        # 2. Vectorize
+        query_emb = self.retriever.model.encode([hyde_doc])
+        
+        # 3. Community Filter
+        allowed_ids = self._community_filter(query_emb, top_c=2)
+        
+        # 4. Dense 精搜种子节点
+        scores = self.retriever.get_scores_by_emb(query_emb[0])
+        
+        if len(scores) == 0:
+            return {"notes": [], "community_context": "", "communities": []}
+            
+        seed_scores = []
+        for i, doc_str in enumerate(self.retriever.corpus):
+            # 确保下标在字典范围内
+            if i < len(all_memories_list):
+                mem = all_memories_list[i]
+                if allowed_ids is None or mem.id in allowed_ids:
+                    seed_scores.append((mem.id, scores[i]))
+                    
+        # 提取 Top-K 种子
+        seed_scores.sort(key=lambda x: x[1], reverse=True)
+        top_seeds = [t[0] for t in seed_scores[:k]]
+        
+        # 5. PPR 多跳
+        if top_seeds:
+            ppr_results = self._ppr_walk(top_seeds, damping=0.8, max_hops=2)
+        else:
+            ppr_results = {}
+            
+        # 6. 合并收网 (过滤掉得分过低的节点)
+        final_list = []
+        for mid, sc in ppr_results.items():
+            if mid in self.memories and sc > 0.1:
+                final_list.append((self.memories[mid], sc))
+                
+        final_list.sort(key=lambda x: x[1], reverse=True)
+        related_notes = [x[0] for x in final_list[:k*2]] # 留多点证据给后续的Reflection验证
+        
+        # 如果依然不够，回退填充
+        if len(related_notes) < k and seed_scores:
+             existing_ids = set(n.id for n in related_notes)
+             for t in seed_scores:
+                 if t[0] not in existing_ids and t[0] in self.memories:
+                     related_notes.append(self.memories[t[0]])
+                 if len(related_notes) >= k*2:
+                     break
+                     
+        # 7. 拼接社区语境 (Community Context)
+        involved_community_ids = set()
+        for note in related_notes:
+            if note.community_id and note.community_id in self.communities:
+                involved_community_ids.add(note.community_id)
+
+        involved_communities = [self.communities[cid] for cid in involved_community_ids]
+
+        community_context = ""
+        for cs in involved_communities:
+            community_context += (
+                f"【{cs.title}】{cs.summary} "
+                f"(涉及关键词: {', '.join(cs.keywords[:5])})\n"
+            )
+
+        return {
+            "notes": related_notes,
+            "community_context": community_context.strip(),
+            "communities": involved_communities,
+        }
+
     def save_graph(self, save_dir: str) -> None:
         """
         持久化 GraphRAG 状态：图边、社区摘要、社区 embeddings。
@@ -2024,52 +2141,4 @@ class AgenticMemorySystem:
 
     # ══════════════════════════════════════════════════════════════════════
     # ██  GraphRAG 方法结束
-    # ══════════════════════════════════════════════════════════════════════
-
-def run_tests():
-    """
-    运行系统测试
-    
-    初始化记忆系统并添加测试记忆，然后查询相关记忆
-    """
-    print("Starting Memory System Tests...")
-    
-    # 使用OpenAI后端初始化记忆系统
-    memory_system = AgenticMemorySystem(
-        model_name='all-MiniLM-L6-v2',
-        llm_backend='openai',
-        llm_model='gpt-4o-mini'
-    )
-    
-    print("\nAdding test memories...")
-    
-    # 添加测试记忆 - 只需提供内容
-    memory_ids = []
-    memory_ids.append(memory_system.add_note(
-        "Neural networks are composed of layers of neurons that process information."
-    ))
-    
-    memory_ids.append(memory_system.add_note(
-        "Data preprocessing involves cleaning and transforming raw data for model training."
-    ))
-    
-    print("\nQuerying for related memories...")
-    query = MemoryNote(
-        content="How do neural networks process data?",
-        llm_controller=memory_system.llm_controller
-    )
-    
-    related = memory_system.find_related_memories(query.content, k=2)
-    print("related", related)
-    print("\nResults:")
-    for i, memory in enumerate(related, 1):
-        print(f"\n{i}. Memory:")
-        print(f"Content: {memory.content}")
-        print(f"Category: {memory.category}")
-        print(f"Keywords: {memory.keywords}")
-        print(f"Tags: {memory.tags}")
-        print(f"Context: {memory.context}")
-        print("-" * 50)
-
-if __name__ == "__main__":
-    run_tests()
+    # ══════════════════════════════════════════════════════════════════════

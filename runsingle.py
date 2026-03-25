@@ -60,10 +60,15 @@ class advancedMemAgent:
 
     # def retrieve_memory(self, content, k=10):
     #     return self.memory_system.find_related_memories_raw(content, k=k)
-    def retrieve_memory(self, content, k=None):
+    def retrieve_memory(self, content, k=None, use_agentic: bool = False):
         if k is None:
             k = self.retrieve_k
-        # 激活 GraphRAG 的社区感知检索！
+            
+        if use_agentic:
+            # 使用新加入的 Agentic Decomposition 与 Reflection 分析闭环链路
+            return self.memory_system.agentic_retrieve(content, k=k)
+            
+        # 默认：激活 GraphRAG 的社区感知检索！
         return self.memory_system.find_related_memories_with_community(content, k=k)
 
     def retrieve_memory_llm(self, memories_text, query):
@@ -132,14 +137,60 @@ class advancedMemAgent:
             response = response.strip()
         return response
 
+    def generate_chunk_context(self, session_full_text: str, turn_text: str) -> str:
+        """
+        Context Retrieval 核心方法：
+        给定整个 Session 的上下文，提示 LLM 为单句对话生成其依赖的语境或解释。
+        例如指代消解、意图说明等。
+        """
+        prompt = f"""You are a helpful assistant that provides context for isolated conversational turns.
+Given the full conversation history (Session Full Text) and exactly ONE target isolated turn, write a short 1-2 sentence context explaining what the isolated turn refers to. For example, resolve any pronouns (he/she/it/this) to their specific entities, and clarify the topic being discussed.
+
+Session Full Text:
+{session_full_text}
+
+Target Isolated Turn:
+{turn_text}
+
+Output ONLY your generated context as a JSON object:
+{{
+    "context": "Context explaining the turn..."
+}}"""
+
+        try:
+            response = self.retriever_llm.llm.get_completion(
+                prompt,
+                response_format={
+                    "type": "json_schema", 
+                    "json_schema": {
+                        "name": "context_generation",
+                        "schema": {
+                            "type": "object",
+                            "properties": {"context": {"type": "string"}},
+                            "required": ["context"],
+                            "additionalProperties": False
+                        },
+                        "strict": True
+                    }
+                },
+                temperature=0.1
+            )
+            clean_resp = response.strip()
+            if not clean_resp.startswith("{"):
+                clean_resp = clean_resp[clean_resp.find("{"):]
+            if not clean_resp.endswith("}"):
+                clean_resp = clean_resp[:clean_resp.rfind("}")+1]
+            return json.loads(clean_resp)["context"]
+        except Exception as e:
+            print(f"⚠ Failed to generate chunk context: {e}")
+            return "General context"
+
     def answer_question(self, question: str, category: int, answer: str) -> str:
         """Generate answer for a question given the conversation context."""
-        keywords = self.generate_query_llm(question)
-        # if category == 3:
-        #     raw_context = self.retrieve_memory(keywords,k=10)
-        #     # context = self.retrieve_memory_llm(raw_context, keywords)
-        # else:
-        raw_context = self.retrieve_memory(keywords, k=self.retrieve_k)
+        # 强制开启 Agentic Retrieval (包含逻辑拆解、反思令牌与逻辑闭环)
+        # 传递完整的 question 而非 keywords，以便 AgenticDecomposer 获取完整上下文意图
+        raw_context = self.retrieve_memory(question, k=self.retrieve_k, use_agentic=True)
+        
         context = raw_context
         # print("context:", context)
         # context = self.retrieve_memory_llm(raw_context, question)
@@ -382,10 +433,22 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
             # ── 重新构建：逐条 add_note，触发实时演化 + 社区聚类 ─────
             logger.info(f"🔄 重新构建记忆（sample {original_sample_idx}）...")
             for _, turns in sample.conversation.sessions.items():
+                
+                # Context Retrieval 步骤 1：构建全局文档视角 (Global Session View)
+                session_full_text = "\n".join([f"Speaker {t.speaker} says : {t.text}" for t in turns.turns])
+                
                 for turn in turns.turns:
                     turn_datatime = turns.date_time
-                    conversation_tmp = "Speaker " + turn.speaker + "says : " + turn.text
-                    agent.add_memory(conversation_tmp, time=turn_datatime)
+                    conversation_tmp = "Speaker " + turn.speaker + " says : " + turn.text
+                    
+                    # Context Retrieval 步骤 2：局部块上下文生成 (Chunk Context Generation)
+                    # 提示 LLM 根据全局上下文为单个孤立句子生成背景解释
+                    chunk_context = agent.generate_chunk_context(session_full_text, conversation_tmp)
+                    
+                    # Context Retrieval 步骤 3：内容融合与向量化
+                    enriched_content = f"Context: {chunk_context}\nContent: {conversation_tmp}"
+                    
+                    agent.add_memory(enriched_content, time=turn_datatime)
 
             # 同步计数（add_note 已自增，这里做最终校正）
             agent.memory_system.note_total_count = len(agent.memory_system.memories)
