@@ -55,8 +55,11 @@ class advancedMemAgent:
         self.retrieve_k = retrieve_k
         self.temperature_c5 = temperature_c5
 
-    def add_memory(self, content, time=None):
-        self.memory_system.add_note(content, time=time)
+    def add_memories_batch(self, contents: List[str], times: List[str] = None):
+        """
+        批量添加记忆以利用批量向量化优化
+        """
+        self.memory_system.add_notes_batch(contents, times=times)
 
     # def retrieve_memory(self, content, k=10):
     #     return self.memory_system.find_related_memories_raw(content, k=k)
@@ -286,6 +289,10 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
         output_path: Path to save results
         ratio: Ratio of dataset to evaluate
     """
+    # 固定随机种子，确保评测可重复性
+    random.seed(42)
+    np.random.seed(42)
+    
     # Generate automatic log filename with timestamp
     timestamp = datetime.now().strftime("%Y-%m-%d-%H-%M")
     log_filename = f"eval_ours_{model}_{backend}_ratio{ratio}_{timestamp}.log"
@@ -437,6 +444,9 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
                 # Context Retrieval 步骤 1：构建全局文档视角 (Global Session View)
                 session_full_text = "\n".join([f"Speaker {t.speaker} says : {t.text}" for t in turns.turns])
                 
+                batch_contents = []
+                batch_times = []
+                
                 for turn in turns.turns:
                     turn_datatime = turns.date_time
                     conversation_tmp = "Speaker " + turn.speaker + " says : " + turn.text
@@ -448,7 +458,12 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
                     # Context Retrieval 步骤 3：内容融合与向量化
                     enriched_content = f"Context: {chunk_context}\nContent: {conversation_tmp}"
                     
-                    agent.add_memory(enriched_content, time=turn_datatime)
+                    batch_contents.append(enriched_content)
+                    batch_times.append(turn_datatime)
+                    
+                # 批量向量化与添加
+                if batch_contents:
+                    agent.add_memories_batch(batch_contents, times=batch_times)
 
             # 同步计数（add_note 已自增，这里做最终校正）
             agent.memory_system.note_total_count = len(agent.memory_system.memories)
@@ -482,7 +497,7 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
                 prediction, user_prompt, raw_context = agent.answer_question(qa.question, qa.category, qa.final_answer)
                 try:
                     prediction = json.loads(prediction)["answer"]
-                except:
+                except (json.JSONDecodeError, KeyError, TypeError):
                     # 增强的JSON解析和兜底逻辑
                     import re
                     # 1. 尝试清洗 Markdown 标记
@@ -498,7 +513,7 @@ def evaluate_dataset(dataset_path: str, model: str, output_path: Optional[str] =
                     try:
                         # 2. 尝试解析清洗后的 JSON
                         prediction = json.loads(clean_prediction)["answer"]
-                    except:
+                    except (json.JSONDecodeError, KeyError, TypeError):
                         # 3. 尝试正则提取
                         match = re.search(r'"answer":\s*"(.*?)"', clean_prediction)
                         if match:

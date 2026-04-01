@@ -24,18 +24,35 @@ try:
 except Exception as e:
     print(f"Error downloading NLTK data: {e}")
 
+import os
+# Configure HuggingFace to use domestic mirror BEFORE importing SentenceTransformer
+os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+
 # Initialize SentenceTransformer model (this will be reused)
 try:
+    # 第一次运行如果本地没有模型，会自动从 hf-mirror.com 下载 BAAI/bge-m3 到 ~/.cache/huggingface/hub/
     sentence_model = SentenceTransformer('BAAI/bge-m3')
 except Exception as e:
     print(f"Warning: Could not load SentenceTransformer model: {e}")
     sentence_model = None
 
 def simple_tokenize(text):
-    """Simple tokenization function."""
-    # Convert to string if not already
+    """
+    Tokenization function using tiktoken (cl100k_base) for robust multi-language and symbol handling.
+    Falls back to simple whitespace tokenization if tiktoken is not available.
+    """
     text = str(text)
-    return text.lower().replace('.', ' ').replace(',', ' ').replace('!', ' ').replace('?', ' ').split()
+    try:
+        import tiktoken
+        # Use cl100k_base, the standard tokenizer for GPT-4/3.5
+        enc = tiktoken.get_encoding("cl100k_base")
+        # Encode returns a list of integer token IDs, we convert them back to strings
+        # to match the expected return type (list of strings) for downstream metrics
+        token_ids = enc.encode(text)
+        return [str(tid) for tid in token_ids]
+    except ImportError:
+        # Fallback to the original simple tokenization
+        return text.lower().replace('.', ' ').replace(',', ' ').replace('!', ' ').replace('?', ' ').split()
 
 def calculate_rouge_scores(prediction: str, reference: str) -> Dict[str, float]:
     """Calculate ROUGE scores for prediction against reference."""
@@ -99,6 +116,12 @@ def calculate_sentence_similarity(prediction: str, reference: str) -> float:
         embedding1 = sentence_model.encode([prediction], convert_to_tensor=True)
         embedding2 = sentence_model.encode([reference], convert_to_tensor=True)
         
+        # 确保维度对齐，防止有些模型后端返回 (D,) 导致 pytorch_cos_sim 报错
+        if len(embedding1.shape) == 1:
+            embedding1 = embedding1.unsqueeze(0)
+        if len(embedding2.shape) == 1:
+            embedding2 = embedding2.unsqueeze(0)
+            
         # Calculate cosine similarity
         similarity = pytorch_cos_sim(embedding1, embedding2).item()
         return float(similarity)

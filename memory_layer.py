@@ -636,22 +636,19 @@ class CommunitySummary:
 
 class HybridRetriever:
     """
-    混合检索系统
+    语义检索系统
     
-    结合BM25和语义搜索的检索器
+    使用 Dense 向量的语义检索器
     """
     
-    def __init__(self, model_name: str = 'BAAI/bge-m3', alpha: float = 0.65):
+    def __init__(self, model_name: str = 'BAAI/bge-m3'):
         """
-        初始化混合检索器
+        初始化语义检索器
         
         参数:
             model_name: 使用的SentenceTransformer模型名称
-            alpha: BM25和语义得分组合的权重（0 = 仅BM25，1 = 仅语义搜索）
         """
         self.model = SentenceTransformer(model_name)
-        self.alpha = alpha
-        self.bm25 = None
         self.corpus = []
         self.embeddings = None
         self.document_ids = {}  # 文档内容到索引的映射
@@ -672,8 +669,6 @@ class HybridRetriever:
             
         # 使用pickle保存其他所有内容
         state = {
-            'alpha': self.alpha,
-            'bm25': self.bm25,
             'corpus': self.corpus,
             'document_ids': self.document_ids,
             'model_name': 'BAAI/bge-m3'  # 模型名称的默认值
@@ -706,11 +701,9 @@ class HybridRetriever:
         
         # 使用默认值，防止缺少键的情况
         model_name = state.get('model_name', 'BAAI/bge-m3')
-        alpha = state.get('alpha', 0.65)
             
         # 创建新实例
-        retriever = cls(model_name=model_name, alpha=alpha)
-        retriever.bm25 = state.get('bm25')
+        retriever = cls(model_name=model_name)
         retriever.corpus = state.get('corpus', [])
         retriever.document_ids = state.get('document_ids', {})
         
@@ -722,7 +715,7 @@ class HybridRetriever:
         return retriever
     
     @classmethod
-    def load_from_local_memory(cls, memories: Dict, model_name: str, alpha: float, 
+    def load_from_local_memory(cls, memories: Dict, model_name: str, 
                               embeddings_cache_file: str = None) -> 'HybridRetriever':
         """
         从内存中的记忆对象加载检索器状态
@@ -730,14 +723,13 @@ class HybridRetriever:
         参数:
             memories: 记忆字典
             model_name: 使用的模型名称
-            alpha: BM25和语义得分组合的权重
             embeddings_cache_file: 可选的嵌入向量缓存文件路径，如果提供则复用已有嵌入向量
             
         返回:
             创建的检索器实例
         """
         all_docs = [", ".join(m.keywords) for m in memories.values()] #[m.content for m in memories.values()]
-        retriever = cls(model_name, alpha)
+        retriever = cls(model_name)
         
         # 如果提供了嵌入向量缓存文件且文件存在，尝试加载
         if embeddings_cache_file and Path(embeddings_cache_file).exists():
@@ -748,10 +740,6 @@ class HybridRetriever:
                     retriever.corpus = all_docs
                     retriever.embeddings = cached_embeddings
                     retriever.document_ids = {doc: idx for idx, doc in enumerate(all_docs)}
-                    
-                    # 根据升级计划弃用 BM25
-                    # tokenized_docs = [doc.lower().split() for doc in all_docs]
-                    # retriever.bm25 = BM25Okapi(tokenized_docs)
                     
                     print(f"✓ 成功复用已有嵌入向量缓存")
                     return retriever
@@ -764,30 +752,40 @@ class HybridRetriever:
         retriever.add_documents(all_docs)
         return retriever
     
-    def add_documents(self, documents: List[str]) -> bool:
+    def add_documents(self, documents: List[str], batch_size: int = 32) -> bool:
         """
-        一次性添加文档到BM25和语义索引中
+        一次性添加文档到语义索引中 (支持批量向量化)
         
         参数:
             documents: 文档文本列表
+            batch_size: 批量向量化大小
             
         返回:
             True表示成功添加
         """
         if not documents:
-            return
+            return False
             
-        # 为BM25进行分词 (弃用)
-        # tokenized_docs = [doc.lower().split() for doc in documents]
-        # self.bm25 = BM25Okapi(tokenized_docs)
+        # 创建嵌入向量 (使用 batch_size 提速)
+        new_embeddings = self.model.encode(documents, batch_size=batch_size)
         
-        # 创建嵌入向量
-        self.embeddings = self.model.encode(documents)
-        self.corpus = documents
-        doc_idx = 0
+        # 修复：确保 new_embeddings 是 numpy array 且为二维 (N, D)
+        if hasattr(new_embeddings, 'numpy'):
+            new_embeddings = new_embeddings.numpy()
+        if len(new_embeddings.shape) == 1:
+            new_embeddings = new_embeddings.reshape(1, -1)
+        
+        if self.embeddings is None:
+            self.embeddings = new_embeddings
+        else:
+            self.embeddings = np.vstack([self.embeddings, new_embeddings])
+            
+        doc_idx = len(self.corpus)
         for document in documents:
-            self.document_ids[document] = doc_idx
-            doc_idx += 1
+            if document not in self.document_ids:
+                self.corpus.append(document)
+                self.document_ids[document] = doc_idx
+                doc_idx += 1
 
         return True
 
@@ -810,17 +808,17 @@ class HybridRetriever:
         self.corpus.append(document)
         self.document_ids[document] = doc_idx
         
-        # 更新BM25 (弃用)
-        # if self.bm25 is None:
-        #     tokenized_corpus = [simple_tokenize(document)]
-        #     self.bm25 = BM25Okapi(tokenized_corpus)
-        # else:
-        #     tokenized_doc = simple_tokenize(document)
-        #     self.bm25.add_document(tokenized_doc)
-        
         # 更新嵌入向量
         # 修复：使用 numpy 进行拼接，避免 tensor 类型不匹配错误
+        # 修复：将一维数组转换为二维数组 (1, D)
         doc_embedding = self.model.encode([document])
+        if hasattr(doc_embedding, 'numpy'): # If it's a tensor
+            doc_embedding = doc_embedding.numpy()
+        
+        # 确保形状是 (1, D)
+        if len(doc_embedding.shape) == 1:
+            doc_embedding = doc_embedding.reshape(1, -1)
+            
         if self.embeddings is None:
             self.embeddings = doc_embedding
         else:
@@ -846,8 +844,15 @@ class HybridRetriever:
         # BM25 已弃用，始终走纯 Dense 语义路径
         if self.embeddings is None:
             return ([] if not return_scores else ([], []))
-        query_embedding = self.model.encode([query])[0]
-        hybrid_scores = cosine_similarity([query_embedding], self.embeddings)[0]
+            
+        query_embedding = self.model.encode([query])
+        # 防御性转换：确保是 NumPy 数组且为二维 (1, D)
+        if hasattr(query_embedding, 'numpy'):
+            query_embedding = query_embedding.numpy()
+        if len(query_embedding.shape) == 1:
+            query_embedding = query_embedding.reshape(1, -1)
+            
+        hybrid_scores = cosine_similarity(query_embedding, self.embeddings)[0]
         
         # 获取前k个索引
         k = min(k, len(self.corpus))
@@ -873,6 +878,13 @@ class HybridRetriever:
         if self.embeddings is None or len(self.corpus) == 0:
             return np.array([])
 
+        # 防御性转换：确保是 NumPy 数组
+        if hasattr(query_embedding, 'numpy'):
+            query_embedding = query_embedding.numpy()
+            
+        # 强制 query_embedding 变为一维以进行点积计算
+        query_embedding = np.squeeze(query_embedding)
+        
         embeddings_arr = np.array(self.embeddings)
         norm_q = np.linalg.norm(query_embedding)
         norm_e = np.linalg.norm(embeddings_arr, axis=1)
@@ -1103,12 +1115,12 @@ class AgenticMemorySystem:
                                 Make decisions about its evolution.  
 
                                 The new memory context:
-                                {context}
-                                content: {content}
-                                keywords: {keywords}
+                                {{context}}
+                                content: {{content}}
+                                keywords: {{keywords}}
 
                                 The nearest neighbors memories:
-                                {nearest_neighbors_memories}
+                                {{nearest_neighbors_memories}}
 
                                 Based on this information, determine:
                                 1. Should this memory be evolved? Consider its relationships with other memories.
@@ -1117,7 +1129,7 @@ class AgenticMemorySystem:
                                    2.2 If choose to update_neighbor, you can update the context and tags of these memories based on the understanding of these memories. If the context and the tags are not updated, the new context and tags should be the same as the original ones. Generate the new context and tags in the sequential order of the input neighbors.
                                 Tags should be determined by the content of these characteristic of these memories, which can be used to retrieve them later and categorize them.
                                 Note that the length of new_tags_neighborhood must equal the number of input neighbors, and the length of new_context_neighborhood must equal the number of input neighbors.
-                                The number of neighbors is {neighbor_number}.
+                                The number of neighbors is {{neighbor_number}}.
                                 Return your decision in JSON format with the following structure:
                                 {{
                                     "should_evolve": True or False,
@@ -1147,7 +1159,60 @@ class AgenticMemorySystem:
         self.edge_semantic_threshold: float = 0.70
         # 关键词共现边阈值（Jaccard）
         self.edge_jaccard_threshold: float = 0.20
+        # 图状态缓存脏标记
+        self._graph_is_dirty: bool = False
         # ────────────────────────────────────────────────────────────
+
+    def add_notes_batch(self, contents: List[str], times: List[str] = None, **kwargs) -> List[str]:
+        """
+        批量添加新的记忆笔记并进行批量向量化 (Batch Embedding)
+        
+        参数:
+            contents: 记忆内容文本列表
+            times: 时间戳列表（可选）
+            **kwargs: 其他可选参数
+            
+        返回:
+            新添加记忆的ID列表
+        """
+        if not contents:
+            return []
+            
+        if times is None:
+            times = [None] * len(contents)
+            
+        note_ids = []
+        docs_to_add = []
+        
+        for content, time in zip(contents, times):
+            note = MemoryNote(content=content, llm_controller=self.llm_controller, timestamp=time, **kwargs)
+            evo_label, note = self.process_memory(note)
+            self.memories[note.id] = note
+            
+            doc_text = "content:" + note.content + " context:" + note.context + " keywords: " + ", ".join(note.keywords) + " tags: " + ", ".join(note.tags)
+            docs_to_add.append(doc_text)
+            
+            # ── GraphRAG：构建图边 ─────────────────────
+            self._build_edges_for_new_note(note)
+            self.note_total_count += 1
+            self._graph_is_dirty = True
+            
+            note_ids.append(note.id)
+            
+            if evo_label == True:
+                self.evo_cnt += 1
+                
+        # 批量进行 Embedding 并更新检索器
+        if docs_to_add:
+            self.retriever.add_documents(docs_to_add, batch_size=32)
+            
+        if self.evo_cnt > 0 and self.evo_cnt % self.evo_threshold == 0:
+            self.consolidate_memories()
+            
+        if self.note_total_count % self.community_rebuild_interval == 0:
+            self.rebuild_communities()
+            
+        return note_ids
 
     def add_note(self, content: str, time: str = None, **kwargs) -> str:
         """
@@ -1177,6 +1242,10 @@ class AgenticMemorySystem:
         # ── GraphRAG：构建图边 + 触发社区重聚类 ─────────────────────
         self._build_edges_for_new_note(note)
         self.note_total_count += 1
+        
+        # 标记图为 dirty，下次需要社区时再聚类
+        self._graph_is_dirty = True
+        
         if self.note_total_count % self.community_rebuild_interval == 0:
             self.rebuild_communities()
         # ────────────────────────────────────────────────────────────
@@ -1236,7 +1305,12 @@ class AgenticMemorySystem:
         for i in indices:
             neighbor_memory += "memory index:" + str(i) + "\t talk start time:" + all_memories[i].timestamp + "\t memory content: " + all_memories[i].content + "\t memory context: " + all_memories[i].context + "\t memory keywords: " + str(all_memories[i].keywords) + "\t memory tags: " + str(all_memories[i].tags) + "\n"
 
-        prompt_memory = self.evolution_system_prompt.format(context=note.context, content=note.content, keywords=note.keywords, nearest_neighbors_memories=neighbor_memory,neighbor_number=len(indices))
+        # 使用安全的字符串替换，避免大括号注入导致 format 崩溃
+        prompt_memory = self.evolution_system_prompt.replace("{{context}}", note.context)\
+                                                    .replace("{{content}}", note.content)\
+                                                    .replace("{{keywords}}", str(note.keywords))\
+                                                    .replace("{{nearest_neighbors_memories}}", neighbor_memory)\
+                                                    .replace("{{neighbor_number}}", str(len(indices)))
         print("prompt_memory", prompt_memory)
         response = self.llm_controller.llm.get_completion(
             prompt_memory,response_format={"type": "json_schema", "json_schema": {
@@ -1641,7 +1715,7 @@ class AgenticMemorySystem:
 
     def _run_community_detection(self, G) -> Dict[str, int]:
         """
-        在图 G 上运行 Louvain 社区检测。
+        在图 G 上运行 Louvain 社区检测（增加节点密度自适应）。
 
         参数:
             G: networkx.Graph 对象
@@ -1658,10 +1732,27 @@ class AgenticMemorySystem:
 
         if len(G.nodes) == 0:
             return {}
+            
+        # 1. 运行时密度监测 (Weighted Average Degree)
+        total_weight = G.size(weight='weight')
+        num_nodes = len(G.nodes)
+        avg_degree = (2.0 * total_weight) / num_nodes if num_nodes > 0 else 0
+        
+        # 2. 动态参数热计算
+        d_base = 3.0
+        alpha = 0.5
+        import math
+        if avg_degree > 0:
+            resolution = 1.0 + alpha * math.log(1 + max(0, avg_degree - d_base) / d_base)
+        else:
+            resolution = 1.0
+            
+        # 边界截断保护
+        resolution = max(0.5, min(2.5, resolution))
 
         # 孤立节点（无边）也可被 Louvain 分配到单独社区
         # 注意：python-louvain 的 best_partition 不支持 random_state 参数
-        partition = community_louvain.best_partition(G, weight="weight")
+        partition = community_louvain.best_partition(G, weight="weight", resolution=resolution)
         return partition   # {node_id_str: community_int}
 
     def _generate_community_summary(
@@ -1684,23 +1775,27 @@ class AgenticMemorySystem:
             )
 
         # 构造 Prompt 内容
+        # 优化：引入时序信息，确保事件逻辑顺序正确
+        members = sorted(members, key=lambda m: m.timestamp)
         notes_text = ""
-        for m in members[:20]:   # 最多取前20条避免超 context
+        for m in members[:50]:   # 放宽到前50条，充分利用现代大模型上下文窗口
             notes_text += (
                 f"[{m.timestamp}] {m.content} "
                 f"(keywords: {', '.join(m.keywords[:5])})\n"
             )
 
-        prompt = f"""你是一个记忆聚类分析专家。以下是属于同一主题聚类的 {len(members)} 条记忆片段：
+        prompt = f"""You are a memory clustering expert. Below are {min(len(members), 50)} memory fragments (out of {len(members)} total in this cluster) belonging to the same topic cluster, ordered by time:
 
 {notes_text}
 
-请综合分析这组记忆，生成：
-1. title：一句话概括核心主题（≤20字）
-2. summary：对这组记忆的综合描述（≤200字），涵盖主要事件、实体、时间线
-3. keywords：5-10个代表性关键词列表
+Analyze this group of memories and generate a comprehensive JSON summary. Your analysis must capture the core topic, main events, key entities, and chronological timeline.
 
-以JSON格式返回：{{"title": "...", "summary": "...", "keywords": [...]}}"""
+Please ensure:
+1. "title": A single sentence summarizing the core topic (max 10 words).
+2. "summary": A comprehensive summary of the memories (max 100 words), covering the main events, entities, and the timeline.
+3. "keywords": Provide exactly 5 to 10 representative and unique keywords that best describe this cluster.
+
+Respond strictly in valid JSON format matching the required schema."""
 
         response_format = {
             "type": "json_schema",
@@ -1711,7 +1806,13 @@ class AgenticMemorySystem:
                     "properties": {
                         "title":    {"type": "string"},
                         "summary":  {"type": "string"},
-                        "keywords": {"type": "array", "items": {"type": "string"}},
+                        "keywords": {
+                            "type": "array", 
+                            "items": {"type": "string"},
+                            "minItems": 5,
+                            "maxItems": 10,
+                            "uniqueItems": True
+                        },
                     },
                     "required": ["title", "summary", "keywords"],
                     "additionalProperties": False,
@@ -1739,7 +1840,13 @@ class AgenticMemorySystem:
         embedding = None
         if summary:
             try:
-                embedding = self.retriever.model.encode([summary])[0]
+                emb = self.retriever.model.encode([summary])
+                if hasattr(emb, 'numpy'):
+                    emb = emb.numpy()
+                # 确保保存的社区 embedding 是一维的 numpy 数组
+                if len(emb.shape) == 2:
+                    emb = emb[0]
+                embedding = emb
             except Exception as e:
                 print(f"⚠ 社区 embedding 生成失败: {e}")
 
@@ -1765,6 +1872,10 @@ class AgenticMemorySystem:
         会自动更新每条 note 的 community_id 字段。
         """
         if len(self.memories) < 2:
+            return
+            
+        if not self._graph_is_dirty and len(self.communities) > 0:
+            print(f"⏩ GraphRAG: 图结构未变脏，跳过社区重建")
             return
 
         print(f"🔄 GraphRAG: 重建社区（共 {len(self.memories)} 条记忆）...")
@@ -1819,6 +1930,9 @@ class AgenticMemorySystem:
             self.community_embeddings = np.stack(all_embeddings, axis=0)
         else:
             self.community_embeddings = None
+            
+        # 重建完成后，重置脏标记
+        self._graph_is_dirty = False
 
         print(
             f"✅ GraphRAG: 社区重建完成，共 {len(new_communities)} 个社区："
@@ -1933,6 +2047,12 @@ Output JUST the hypothetical answer text, nothing else."""
         """
         if not self.communities or self.community_embeddings is None:
             return None
+            
+        # 防御性转换：确保是 NumPy 数组且为二维 (1, D)
+        if hasattr(query_emb, 'numpy'):
+            query_emb = query_emb.numpy()
+        if len(query_emb.shape) == 1:
+            query_emb = query_emb.reshape(1, -1)
             
         sims = cosine_similarity(query_emb, self.community_embeddings)[0]
         k = min(top_c, len(self.community_ids_list))
@@ -2141,4 +2261,4 @@ Output JUST the hypothetical answer text, nothing else."""
 
     # ══════════════════════════════════════════════════════════════════════
     # ██  GraphRAG 方法结束
-    # ══════════════════════════════════════════════════════════════════════
+    # ══════════════════════════════════════════════════════════════════════

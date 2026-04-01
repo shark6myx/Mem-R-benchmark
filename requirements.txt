@@ -6,6 +6,7 @@ torch==2.4.0
 transformers==4.46.3
 nltk==3.9.1
 rank-bm25==0.2.2
+tiktoken>=0.7.0      # Required for fast robust tokenization in utils.py
 
 # LLM API clients
 openai==1.61.1
@@ -21,6 +22,8 @@ tqdm==4.66.1
 pandas==2.2.3
 pathlib==1.0.1
 python-dotenv==1.0.1
+tenacity>=8.2.0      # Required for retry logic in memory_layer.py
+requests>=2.31.0     # Required for API requests
 
 # GraphRAG community clustering
 networkx>=3.0          # Graph data structure for community detection
