@@ -1,5 +1,5 @@
 from typing import Optional, Dict, List, Literal, Any, Union, Tuple
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception, retry_if_exception_type
 import openai
 import json
 from dataclasses import dataclass, field
@@ -17,6 +17,17 @@ import requests
 import json as json_lib
 import time
 import torch
+import sys
+
+
+def _should_retry_openai_exception(exc: BaseException) -> bool:
+    if isinstance(exc, openai.AuthenticationError):
+        return False
+    if isinstance(exc, openai.NotFoundError):
+        return False
+    if isinstance(exc, openai.BadRequestError):
+        return False
+    return isinstance(exc, (openai.APIConnectionError, openai.APIError))
 
 class BaseLLMController(ABC):
     """
@@ -43,7 +54,12 @@ class OpenAIController(BaseLLMController):
     
     用于调用OpenAI接口进行文本生成
     """
-    def __init__(self, model: str = "gpt-4", api_key: Optional[str] = None):
+    def __init__(
+        self,
+        model: str = "gpt-4",
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+    ):
         """
         初始化OpenAI控制器
         
@@ -54,20 +70,19 @@ class OpenAIController(BaseLLMController):
         try:
             from openai import OpenAI
             self.model = model
-            if api_key is None:
-                api_key = "sk-dxaeee451185337aec8ac82343fc46a73c5bf846cbf0wXWo"
-            if api_key is None:
-                raise ValueError("OpenAI API key not found. Set OPENAI_API_KEY environment variable.")
-            self.client = OpenAI(api_key=api_key,
-                                 base_url="https://api.gptsapi.net/v1"
-                                 )
+            resolved_api_key = api_key or os.getenv("OPENAI_API_KEY") or "EMPTY"
+            resolved_base_url = base_url or os.getenv("OPENAI_BASE_URL") or None
+            if resolved_base_url:
+                self.client = OpenAI(api_key=resolved_api_key, base_url=resolved_base_url)
+            else:
+                self.client = OpenAI(api_key=resolved_api_key)
         except ImportError:
             raise ImportError("OpenAI package not found. Install it with: pip install openai")
 
     @retry(
         stop=stop_after_attempt(5),  # 最多重试5次
         wait=wait_exponential(multiplier=1, min=2, max=5),  # 重试间隔：指数退避，最小2秒，最大5秒
-        retry=retry_if_exception_type((openai.APIConnectionError, openai.APIError))  # 仅对网络连接错误和API错误进行重试
+        retry=retry_if_exception(_should_retry_openai_exception),
     )
     def get_completion(self, prompt: str, response_format: dict, temperature: float = 0.7) -> str:
         """
@@ -386,12 +401,12 @@ class LLMController:
     用于生成记忆元数据的LLM控制器，支持多种后端
     """
     def __init__(self, 
-                 backend: Literal["openai", "ollama", "sglang"] = "openai",
+                 backend: Literal["openai", "ollama", "sglang", "vllm"] = "openai",
                  model: str = "gpt-4", 
-                 api_key: Optional[str] = "sk-dxaeee451185337aec8ac82343fc46a73c5bf846cbf0wXWo",
+                 api_key: Optional[str] = None,
                  api_base: Optional[str] = None,
-                 # sglang_host: str = "http://localhost",
-                 # sglang_port: int = 30000
+                 sglang_host: str = "http://localhost",
+                 sglang_port: int = 30000,
                  ):
         """
         初始化LLM控制器
@@ -403,7 +418,11 @@ class LLMController:
             api_base: API基础URL（可选）
         """
         if backend == "openai":
-            self.llm = OpenAIController(model, api_key)
+            self.llm = OpenAIController(model=model, api_key=api_key, base_url=api_base)
+        elif backend == "vllm":
+            if not api_base:
+                raise ValueError("vllm backend requires api_base like http://127.0.0.1:8000/v1")
+            self.llm = OpenAIController(model=model, api_key=api_key or "EMPTY", base_url=api_base)
         elif backend == "ollama":
             # 使用LiteLLM控制Ollama并支持JSON输出
             ollama_model = f"ollama/{model}" if not model.startswith("ollama/") else model
@@ -412,11 +431,10 @@ class LLMController:
                 api_base="http://localhost:11434", 
                 api_key="EMPTY"
             )
-        # elif backend == "sglang":
-        #     # 直接调用SGLang API（性能更好，无需代理）
-        #     self.llm = SGLangController(model, sglang_host, sglang_port)
+        elif backend == "sglang":
+            self.llm = SGLangController(model, sglang_host, sglang_port)
         else:
-            raise ValueError("Backend must be 'openai', 'ollama', or 'sglang'")
+            raise ValueError("Backend must be 'openai', 'vllm', 'ollama', or 'sglang'")
 
 class MemoryNote:
     """
@@ -528,6 +546,7 @@ class MemoryNote:
 
             Content for analysis:
             """ + content
+        response: Optional[str] = None
         try:
             response = llm_controller.llm.get_completion(prompt,response_format={"type": "json_schema", "json_schema": {
                         "name": "response",
@@ -584,7 +603,8 @@ class MemoryNote:
 
         except Exception as e:
             print(f"Error analyzing content: {str(e)}")
-            print(f"Raw response: {response}")
+            if response is not None:
+                print(f"Raw response: {response}")
             return {
                 "keywords": [],
                 "context": "General",
@@ -652,6 +672,10 @@ class HybridRetriever:
         self.corpus = []
         self.embeddings = None
         self.document_ids = {}  # 文档内容到索引的映射
+        
+        # ── 稀疏检索 (BM25) ──────────────────────────
+        self.bm25 = None
+        self.tokenized_corpus = []
         
     
     def save(self, retriever_cache_file: str, retriever_cache_embeddings_file: str):
@@ -766,8 +790,13 @@ class HybridRetriever:
         if not documents:
             return False
             
+        # 过滤掉已存在的文档，防止嵌入向量和语料库错位
+        new_docs = [doc for doc in documents if doc not in self.document_ids]
+        if not new_docs:
+            return False
+            
         # 创建嵌入向量 (使用 batch_size 提速)
-        new_embeddings = self.model.encode(documents, batch_size=batch_size)
+        new_embeddings = self.model.encode(new_docs, batch_size=batch_size)
         
         # 修复：确保 new_embeddings 是 numpy array 且为二维 (N, D)
         if hasattr(new_embeddings, 'numpy'):
@@ -780,12 +809,23 @@ class HybridRetriever:
         else:
             self.embeddings = np.vstack([self.embeddings, new_embeddings])
             
+        # 维护 BM25
+        try:
+            from rank_bm25 import BM25Okapi
+            import jieba # 简单分词，如果仅限英文可以 split
+            for document in new_docs:
+                # 使用基础的按字/词切割
+                tokens = list(jieba.cut(document)) if 'jieba' in sys.modules else document.lower().split()
+                self.tokenized_corpus.append(tokens)
+            self.bm25 = BM25Okapi(self.tokenized_corpus)
+        except ImportError:
+            pass
+            
         doc_idx = len(self.corpus)
-        for document in documents:
-            if document not in self.document_ids:
-                self.corpus.append(document)
-                self.document_ids[document] = doc_idx
-                doc_idx += 1
+        for document in new_docs:
+            self.corpus.append(document)
+            self.document_ids[document] = doc_idx
+            doc_idx += 1
 
         return True
 
@@ -823,6 +863,16 @@ class HybridRetriever:
             self.embeddings = doc_embedding
         else:
             self.embeddings = np.vstack([self.embeddings, doc_embedding])
+            
+        # 维护 BM25
+        try:
+            from rank_bm25 import BM25Okapi
+            import jieba
+            tokens = list(jieba.cut(document)) if 'jieba' in sys.modules else document.lower().split()
+            self.tokenized_corpus.append(tokens)
+            self.bm25 = BM25Okapi(self.tokenized_corpus)
+        except ImportError:
+            pass
             
         return True
         
@@ -1074,7 +1124,7 @@ class AgenticMemorySystem:
     """
     智能记忆管理系统
     
-    基于混合检索（BM25 + 语义搜索）的记忆管理系统
+    基于语义检索的记忆管理系统
     """
     def __init__(self, 
                  model_name: str = 'BAAI/bge-m3',
@@ -1085,7 +1135,6 @@ class AgenticMemorySystem:
                  api_base: Optional[str] = None,
                  sglang_host: str = "http://localhost",
                  sglang_port: int = 30000,
-                 retriever_alpha: float = 0.65,
                  use_reranking: bool = True):
         """
         初始化智能记忆系统
@@ -1099,13 +1148,18 @@ class AgenticMemorySystem:
             api_base: API基础URL（可选）
             sglang_host: SGLang服务器主机（可选）
             sglang_port: SGLang服务器端口（可选）
-            retriever_alpha: 混合检索器中BM25和语义得分的权重（0 = 仅BM25，1 = 仅语义搜索）
             use_reranking: 是否启用重排序（使用CrossEncoder提升检索精度）
         """
         self.memories = {}  # id -> MemoryNote
-        self.retriever_alpha = retriever_alpha
-        self.retriever = HybridRetriever(model_name, alpha=retriever_alpha)
-        self.llm_controller = LLMController(llm_backend, llm_model, api_key, api_base)
+        self.retriever = HybridRetriever(model_name)
+        self.llm_controller = LLMController(
+            backend=llm_backend,
+            model=llm_model,
+            api_key=api_key,
+            api_base=api_base,
+            sglang_host=sglang_host,
+            sglang_port=sglang_port,
+        )
         # 重排序相关
         self.use_reranking = use_reranking
         self.reranker = None  # 延迟加载
@@ -1125,7 +1179,7 @@ class AgenticMemorySystem:
                                 Based on this information, determine:
                                 1. Should this memory be evolved? Consider its relationships with other memories.
                                 2. What specific actions should be taken (strengthen, update_neighbor)?
-                                   2.1 If choose to strengthen the connection, which memory should it be connected to? Can you give the updated tags of this memory?
+                                   2.1 If choose to strengthen the connection, which memory should it be connected to? You must also output the specific type of the connection (e.g. "causes", "results_in", "happens_before", "happens_after", "similar_to") in `connection_types`, and give the updated tags of this memory.
                                    2.2 If choose to update_neighbor, you can update the context and tags of these memories based on the understanding of these memories. If the context and the tags are not updated, the new context and tags should be the same as the original ones. Generate the new context and tags in the sequential order of the input neighbors.
                                 Tags should be determined by the content of these characteristic of these memories, which can be used to retrieve them later and categorize them.
                                 Note that the length of new_tags_neighborhood must equal the number of input neighbors, and the length of new_context_neighborhood must equal the number of input neighbors.
@@ -1135,9 +1189,10 @@ class AgenticMemorySystem:
                                     "should_evolve": True or False,
                                     "actions": ["strengthen", "update_neighbor"],
                                     "suggested_connections": ["neighbor_memory_ids"],
+                                    "connection_types": ["connection type strings, corresponding to each connection id"],
                                     "tags_to_update": ["tag_1",..."tag_n"], 
                                     "new_context_neighborhood": ["new context",...,"new context"],
-                                    "new_tags_neighborhood": [["tag_1",...,"tag_n"],...["tag_1",...,"tag_n"]],
+                                    "new_tags_neighborhood": [["tag_1",...,"tag_n"],...["tag_1",...,"tag_n"]]
                                 }}
                                 '''
         self.evo_cnt = 0  # 演化计数器
@@ -1156,12 +1211,64 @@ class AgenticMemorySystem:
         # 已添加 note 计数（用于触发聚类）
         self.note_total_count: int = 0
         # 语义边阈值（cosine similarity）
-        self.edge_semantic_threshold: float = 0.70
+        # 0.70 过低导致边数爆炸 → Louvain 产生少量巨型社区 → 社区过滤失效
+        # 提高至 0.82 可减少约 60% 冗余边，社区粒度更细
+        self.edge_semantic_threshold: float = 0.82
         # 关键词共现边阈值（Jaccard）
         self.edge_jaccard_threshold: float = 0.20
         # 图状态缓存脏标记
         self._graph_is_dirty: bool = False
         # ────────────────────────────────────────────────────────────
+
+    def _get_note_by_doc_idx(self, idx: int) -> Optional[MemoryNote]:
+        """
+        通过语料库索引获取对应的 MemoryNote
+        修复了由于检索器过滤重复文档导致索引与 self.memories 错位的问题
+        """
+        if idx >= len(self.retriever.corpus):
+            all_memories = list(self.memories.values())
+            return all_memories[idx] if idx < len(all_memories) else None
+            
+        doc_text = self.retriever.corpus[idx]
+        
+        # 1. 尝试从新格式 "ID:<uuid> CONTENT:..." 中提取 ID
+        if doc_text.startswith("ID:"):
+            end_id = doc_text.find(" CONTENT:")
+            if end_id != -1:
+                note_id = doc_text[3:end_id]
+                if note_id in self.memories:
+                    return self.memories[note_id]
+                    
+        # 2. 回退：兼容旧的缓存格式
+        for note in self.memories.values():
+            if doc_text == "content:" + note.content + " context:" + note.context + " keywords: " + ", ".join(note.keywords) + " tags: " + ", ".join(note.tags):
+                return note
+            metadata_text = f"{note.context} {' '.join(note.keywords)} {' '.join(note.tags)}"
+            if doc_text == note.content + " , " + metadata_text:
+                return note
+                
+        # 3. 最终回退：直接位置映射（可能错位，但作为兜底）
+        all_memories = list(self.memories.values())
+        if idx < len(all_memories):
+            return all_memories[idx]
+        return None
+
+    def _generate_doc_text(self, note: MemoryNote) -> str:
+        """生成包含 ID 的统一格式检索文本，保证唯一性，防止语料库去重跳过。
+
+        DATE 字段将时间戳（YYYYMMDDHHMI）转换为人类可读格式并写入文本，
+        使 BM25 关键词匹配能命中时间类查询（如 "May 2023"、"June 7"）。
+        """
+        date_str = ""
+        if note.timestamp and len(note.timestamp) >= 8:
+            try:
+                from datetime import datetime as _dt
+                dt = _dt.strptime(note.timestamp[:8], "%Y%m%d")
+                date_str = dt.strftime("%B %d %Y")  # e.g. "May 07 2023"
+            except ValueError:
+                date_str = note.timestamp[:8]
+        date_field = f" DATE:{date_str}" if date_str else ""
+        return f"ID:{note.id}{date_field} CONTENT:{note.content} CONTEXT:{note.context} KEYWORDS:{', '.join(note.keywords)} TAGS:{', '.join(note.tags)}"
 
     def add_notes_batch(self, contents: List[str], times: List[str] = None, **kwargs) -> List[str]:
         """
@@ -1189,7 +1296,7 @@ class AgenticMemorySystem:
             evo_label, note = self.process_memory(note)
             self.memories[note.id] = note
             
-            doc_text = "content:" + note.content + " context:" + note.context + " keywords: " + ", ".join(note.keywords) + " tags: " + ", ".join(note.tags)
+            doc_text = self._generate_doc_text(note)
             docs_to_add.append(doc_text)
             
             # ── GraphRAG：构建图边 ─────────────────────
@@ -1232,7 +1339,7 @@ class AgenticMemorySystem:
         # all_docs = [m.content for m in self.memories.values()]
         evo_label, note = self.process_memory(note)
         self.memories[note.id] = note
-        doc_text = "content:" + note.content + " context:" + note.context + " keywords: " + ", ".join(note.keywords) + " tags: " + ", ".join(note.tags)
+        doc_text = self._generate_doc_text(note)
         self.retriever.add_document(doc_text)
         if evo_label == True:
             self.evo_cnt += 1
@@ -1273,8 +1380,7 @@ class AgenticMemorySystem:
         all_docs = []
         for memory in self.memories.values():
             # 将记忆元数据合并为单个可搜索文档
-            metadata_text = f"{memory.context} {' '.join(memory.keywords)} {' '.join(memory.tags)}"
-            doc_text = memory.content + " , " + metadata_text
+            doc_text = self._generate_doc_text(memory)
             all_docs.append(doc_text)
         
         # 一次性添加所有文档（HybridRetriever的add_documents会重新初始化索引）
@@ -1300,10 +1406,11 @@ class AgenticMemorySystem:
         indices = self._retrieve_indices(note.content, k=5)
         
         # 构建邻居记忆字符串
-        all_memories = list(self.memories.values())
         neighbor_memory = ""
         for i in indices:
-            neighbor_memory += "memory index:" + str(i) + "\t talk start time:" + all_memories[i].timestamp + "\t memory content: " + all_memories[i].content + "\t memory context: " + all_memories[i].context + "\t memory keywords: " + str(all_memories[i].keywords) + "\t memory tags: " + str(all_memories[i].tags) + "\n"
+            mem = self._get_note_by_doc_idx(i)
+            if mem:
+                neighbor_memory += "memory index:" + str(i) + "\t talk start time:" + mem.timestamp + "\t memory content: " + mem.content + "\t memory context: " + mem.context + "\t memory keywords: " + str(mem.keywords) + "\t memory tags: " + str(mem.tags) + "\n"
 
         # 使用安全的字符串替换，避免大括号注入导致 format 崩溃
         prompt_memory = self.evolution_system_prompt.replace("{{context}}", note.context)\
@@ -1333,6 +1440,12 @@ class AgenticMemorySystem:
                                         "type": "integer"
                                     }
                                 },
+                                "connection_types": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "string"
+                                    }
+                                },
                                 "new_context_neighborhood": {
                                     "type": "array",
                                     "items": {
@@ -1355,7 +1468,7 @@ class AgenticMemorySystem:
                                     }
                                 }
                             },
-                            "required": ["should_evolve","actions","suggested_connections","tags_to_update","new_context_neighborhood","new_tags_neighborhood"],
+                            "required": ["should_evolve","actions","suggested_connections","connection_types","tags_to_update","new_context_neighborhood","new_tags_neighborhood"],
                             "additionalProperties": False
                         },
                         "strict": True
@@ -1387,30 +1500,47 @@ class AgenticMemorySystem:
             actions = response_json["actions"]
             for action in actions:
                 if action == "strengthen":
-                    suggest_connections = response_json["suggested_connections"]
-                    new_tags = response_json["tags_to_update"]
-                    note.links.extend(suggest_connections)
+                    suggest_connections = response_json.get("suggested_connections", [])
+                    connection_types = response_json.get("connection_types", [])
+                    new_tags = response_json.get("tags_to_update", [])
+                    
+                    # 修复：将返回的邻居位置索引(int)转换为实际的记忆ID(str)，消除links字段的类型混淆
+                    # 同时将推断出的结构化连边关系保存下来
+                    for list_idx, idx in enumerate(suggest_connections):
+                        if isinstance(idx, int):
+                            target_note = self._get_note_by_doc_idx(idx)
+                            if target_note:
+                                rel_type = connection_types[list_idx] if list_idx < len(connection_types) else "similar_to"
+                                # 以前简单的存储链接ID，现在我们存成字典格式 {"id": id, "type": type}
+                                # 为了兼容原代码的 id 列表格式，我们仍然往 note.links 里加 string 
+                                # 但在 note_id_based_links 之外，我们要提供一种方式把它暴露出去
+                                # 这里我们临时在 note.links 存 dict，如果别的地方不兼容再改。
+                                # 由于 _build_edges_for_new_note 是处理它的下游，我们可以把它传过去
+                                if target_note.id not in [link.get("id") if isinstance(link, dict) else link for link in note.links]:
+                                    note.links.append({"id": target_note.id, "type": rel_type})
+                                
                     note.tags = new_tags
                 elif action == "update_neighbor":
                     new_context_neighborhood = response_json["new_context_neighborhood"]
                     new_tags_neighborhood = response_json["new_tags_neighborhood"]
-                    noteslist = list(self.memories.values())
-                    notes_id = list(self.memories.keys())
-                    print("indices", indices)
                     # 如果小语言模型输出的数量少于邻居数量，则按顺序使用新标签和上下文
                     for i in range(min(len(indices), len(new_tags_neighborhood))):
+                        mem_idx = indices[i]
+                        notetmp = self._get_note_by_doc_idx(mem_idx)
+                        if not notetmp:
+                            continue
+                            
                         # 查找某个记忆
                         tag = new_tags_neighborhood[i]
                         if i < len(new_context_neighborhood):
                             context = new_context_neighborhood[i]
                         else:
-                            context = noteslist[indices[i]].context
-                        memorytmp_idx = indices[i]
-                        notetmp = noteslist[memorytmp_idx]
+                            context = notetmp.context
+                            
                         # 向记忆添加标签
                         notetmp.tags = tag
                         notetmp.context = context
-                        self.memories[notes_id[memorytmp_idx]] = notetmp
+                        self.memories[notetmp.id] = notetmp
         return should_evolve,note
 
     def _get_reranker(self):
@@ -1453,22 +1583,24 @@ class AgenticMemorySystem:
         if reranker is None:
             return retrieved_indices[:k]
         
-        all_memories = list(self.memories.values())
-        
         # 构建查询-文档对
         pairs = []
+        valid_indices = []
         for idx in retrieved_indices:
-            mem = all_memories[idx]
+            mem = self._get_note_by_doc_idx(idx)
+            if not mem:
+                continue
             # 构建文档文本（用于重排序）
             # 优化顺序：关键词 + 标签 + 内容 + 上下文（确保关键元数据不被截断）
             doc_text = f"{', '.join(mem.keywords)} , {', '.join(mem.tags)} , {mem.content} , {mem.context}"
             pairs.append([query, doc_text])
+            valid_indices.append(idx)
         
         # 使用交叉编码器评分（更精确但更慢）
         try:
             scores = reranker.predict(pairs)
             # 按分数排序（分数越高越相关）
-            ranked_indices = [retrieved_indices[i] for i in np.argsort(scores)[::-1]]
+            ranked_indices = [valid_indices[i] for i in np.argsort(scores)[::-1]]
             return ranked_indices[:k]
         except Exception as e:
             print(f"⚠ Warning: Reranking failed: {e}, using original order")
@@ -1490,12 +1622,11 @@ class AgenticMemorySystem:
         返回记忆对象列表
         """
         indices = self._retrieve_indices(query, k)
-        all_memories = list(self.memories.values())
-        return [all_memories[i] for i in indices]
+        return [self._get_note_by_doc_idx(i) for i in indices if self._get_note_by_doc_idx(i)]
 
 
 
-    def agentic_retrieve(self, query: str, k: int = 5) -> str:
+    def agentic_retrieve(self, query: str, k: int = 5, max_verify_per_subquery: int = 8, include_community_context: bool = True) -> Union[str, Dict[str, Any]]:
         """
         基于 Agentic Decomposition 和 Reflection 的智能检索。
         将复杂问题分治后独立检索并过滤。
@@ -1511,6 +1642,7 @@ class AgenticMemorySystem:
         
         all_relevant_contexts = []
         seen_documents = set()
+        involved_communities = set()
         
         # 3. 定向检索与反思过滤
         for sub_q in sub_queries:
@@ -1518,10 +1650,17 @@ class AgenticMemorySystem:
             context_query = f"Intent: {core_intent} Sub-query: {sub_q}"
             
             # 使用升级版的超能漫游检索
-            advanced_result = self.find_related_memories_advanced(context_query, k=k)
+            advanced_result = self.find_related_memories_advanced(context_query, k=k, include_community_context=include_community_context)
             raw_memories = advanced_result.get("notes", [])
             
-            for mem in raw_memories:
+            if include_community_context:
+                comms = advanced_result.get("communities", [])
+                for c in comms:
+                    involved_communities.add(c.community_id)
+                    
+            verify_pool = raw_memories[:max_verify_per_subquery]
+            
+            for mem in verify_pool:
                 doc_text = f"Content: {mem.content} Keywords: {mem.keywords}"
                 if doc_text in seen_documents:
                     continue
@@ -1542,6 +1681,8 @@ class AgenticMemorySystem:
             fallback_memories = self.find_related_memories(query, k=k)
             for mem in fallback_memories:
                 all_relevant_contexts.append(f"[Fallback Evidence] {mem.content} Keywords: {mem.keywords}")
+                if mem.community_id:
+                    involved_communities.add(mem.community_id)
             
         # 5. 验证假设文档的逻辑闭环
         closure_check = verifier.verify_logical_closure(query, all_relevant_contexts)
@@ -1551,8 +1692,13 @@ class AgenticMemorySystem:
             missing_info = closure_check.get("missing_information", "")
             print(f"↻ Logical loop incomplete. Missing: {missing_info}. Triggering follow-up retrieval...")
             followup_query = f"Intent: {core_intent} Missing: {missing_info}"
-            followup_result = self.find_related_memories_advanced(followup_query, k=2)
+            followup_result = self.find_related_memories_advanced(followup_query, k=2, include_community_context=include_community_context)
             followup_memories = followup_result.get("notes", [])
+            
+            if include_community_context:
+                comms = followup_result.get("communities", [])
+                for c in comms:
+                    involved_communities.add(c.community_id)
             
             for mem in followup_memories:
                 doc_text = f"Content: {mem.content} Keywords: {mem.keywords}"
@@ -1564,6 +1710,21 @@ class AgenticMemorySystem:
                     )
             
         final_context = "\n---\n".join(all_relevant_contexts)
+        
+        if include_community_context and involved_communities:
+            community_context = ""
+            for cid in involved_communities:
+                if cid in self.communities:
+                    cs = self.communities[cid]
+                    kws_str = ", ".join(cs.keywords[:5]) if cs.keywords else "无"
+                    community_context += f"【{cs.title}】{cs.summary} (涉及关键词: {kws_str})\n"
+            
+            # 返回字典以匹配 _format_retrieval_context 的处理逻辑
+            return {
+                "notes": [], # _format_retrieval_context 期望的 notes 列表，但由于我们已经自己构建了文本，可以返回空列表，然后直接将 final_context 作为 community_context 的前缀
+                "community_context": f"{final_context}\n\n{community_context}"
+            }
+            
         return final_context
 
     # ══════════════════════════════════════════════════════════════════════
@@ -1604,12 +1765,7 @@ class AgenticMemorySystem:
         if self.retriever.embeddings is not None and self.retriever.embeddings.shape[0] > 1:
             for prev_note in existing_notes:
                 # 查找该 note 对应的检索器文档 key（与 add_note 写入格式一致）
-                prev_doc_key = (
-                    "content:" + prev_note.content
-                    + " context:" + prev_note.context
-                    + " keywords: " + ", ".join(prev_note.keywords)
-                    + " tags: " + ", ".join(prev_note.tags)
-                )
+                prev_doc_key = self._generate_doc_text(prev_note)
                 prev_idx = self.retriever.document_ids.get(prev_doc_key)
                 if prev_idx is None:
                     continue   # 该 note 在检索器中找不到，跳过
@@ -1627,22 +1783,52 @@ class AgenticMemorySystem:
                     if note.id not in prev_note.id_based_links:
                         prev_note.id_based_links.append(note.id)
 
-        # ── 2. 时序边（同 session 内相邻两条） ──────────────────────────
-        # timestamp 格式为 YYYYMMDDHHmm，取前8位作为 session key（同一天）
-        new_session = note.timestamp[:8] if note.timestamp else ""
-        for prev_note in existing_notes[-5:]:   # 只看最近5条，够用且高效
-            prev_session = prev_note.timestamp[:8] if prev_note.timestamp else ""
-            if new_session and prev_session and new_session == prev_session:
+        # ── 2. 改进的时序边（实体生命周期跨会话追踪） ──────────────────────────
+        # 不再仅仅局限于“同一天最近5条”，而是基于共享实体（Entity/Keywords）追踪历史时序
+        # 如果两条记忆包含相同的主体，且时间有先后，则建立跨越时间的长程关联，强化时间线的纵向追踪
+        new_kw_set = set(k.lower() for k in note.keywords)
+        has_temporal_link = False
+        
+        if new_kw_set:
+            # 找到历史中含有相同实体的最近几条记忆
+            shared_entity_notes = []
+            for prev_note in reversed(existing_notes):
+                prev_kw_set = set(k.lower() for k in prev_note.keywords)
+                if prev_kw_set and len(new_kw_set & prev_kw_set) > 0:
+                    shared_entity_notes.append(prev_note)
+                if len(shared_entity_notes) >= 3: # 追踪同一个实体的最近3个生命周期快照
+                    break
+                    
+            for prev_note in shared_entity_notes:
+                # 只在有时间戳时比较，或默认新插入的在后
                 self.graph_edges.append({
-                    "src_id": prev_note.id,
+                    "src_id": prev_note.id, # 过去指向现在
                     "tgt_id": note.id,
-                    "weight": 0.6,
-                    "type": "temporal"
+                    "weight": 0.7,
+                    "type": "temporal_entity_evolution"
                 })
                 if note.id not in prev_note.id_based_links:
                     prev_note.id_based_links.append(note.id)
                 if prev_note.id not in note.id_based_links:
                     note.id_based_links.append(prev_note.id)
+                has_temporal_link = True
+                
+        # 兜底：如果没有任何实体交集，且时间非常近，依然保持基础时序连通性
+        if not has_temporal_link:
+            new_session = note.timestamp[:8] if note.timestamp else ""
+            for prev_note in existing_notes[-2:]:   # 缩小纯瞎连的范围到最近2条
+                prev_session = prev_note.timestamp[:8] if prev_note.timestamp else ""
+                if new_session and prev_session and new_session == prev_session:
+                    self.graph_edges.append({
+                        "src_id": prev_note.id,
+                        "tgt_id": note.id,
+                        "weight": 0.5,
+                        "type": "temporal_adjacent"
+                    })
+                    if note.id not in prev_note.id_based_links:
+                        prev_note.id_based_links.append(note.id)
+                    if prev_note.id not in note.id_based_links:
+                        note.id_based_links.append(prev_note.id)
 
         # ── 3. 关键词共现边（Jaccard）──────────────────────────────────
         new_kw_set = set(k.lower() for k in note.keywords)
@@ -1666,25 +1852,74 @@ class AgenticMemorySystem:
                     if note.id not in prev_note.id_based_links:
                         prev_note.id_based_links.append(note.id)
 
-        # ── 4. LLM evolution 产生的 strengthen links → id_based_links ──
-        # process_memory 写入了 note.links（位置索引），这里同步转 id
-        # （process_memory 在此函数调用前已执行，self.memories 已含新 note）
-        all_ids = list(self.memories.keys())
-        for pos_idx in note.links:
-            if isinstance(pos_idx, int) and 0 <= pos_idx < len(all_ids):
-                linked_id = all_ids[pos_idx]
+        # ── 5. 实体节点（虚拟节点）连边 ──────────────────────────────
+        # 把每个 keyword 显式当作一个图节点（前缀 "ent:"），建立 note -> entity 的连边
+        for kw in note.keywords:
+            if not kw or not str(kw).strip():
+                continue
+            ent_id = f"ent:{str(kw).strip().lower()}"
+            # note 包含 entity，权重设置为固定值（比如 1.0 代表明确包含）
+            self.graph_edges.append({
+                "src_id": note.id,
+                "tgt_id": ent_id,
+                "weight": 1.0,
+                "type": "contains_entity"
+            })
+            # 这里我们不把 ent_id 放入 id_based_links，因为那个通常用于维护真实的 memory 节点引用
+            # 但是它会进入 graph_edges，参与 PPR 和聚类
+        # process_memory 已经将 note.links 写入，现在它可能包含 dict 或 string
+        for link_item in note.links:
+            if isinstance(link_item, dict):
+                linked_id = link_item.get("id")
+                rel_type = link_item.get("type", "llm_inferred")
+            else:
+                linked_id = link_item
+                rel_type = "llm_inferred"
+                
+            if isinstance(linked_id, str) and linked_id in self.memories:
                 if linked_id != note.id and linked_id not in note.id_based_links:
                     note.id_based_links.append(linked_id)
+                    # 添加有向边（如果需要反向也可以加，但保留因果方向更有价值）
                     self.graph_edges.append({
                         "src_id": note.id,
                         "tgt_id": linked_id,
                         "weight": 0.8,
-                        "type": "llm_inferred"
+                        "type": rel_type
                     })
 
+        # ── 6. 稀疏词汇连边 (BM25 Lexical Shared) ──────────────────────────
+        # 使用 BM25 捕捉 Dense 模型可能漏掉的罕见专有名词和缩写
+        if self.retriever.bm25 is not None and len(self.retriever.tokenized_corpus) > 1:
+            try:
+                import jieba
+                doc_text = self._generate_doc_text(note)
+                tokens = list(jieba.cut(doc_text)) if 'jieba' in sys.modules else doc_text.lower().split()
+                # 计算新节点到整个语料库的 BM25 分数
+                bm25_scores = self.retriever.bm25.get_scores(tokens)
+                
+                # 找出分数异常高的节点（比如超过阈值，或显著高于均值）
+                # 这里我们设定一个绝对的稀疏阈值，比如 10.0，说明有罕见词重叠
+                for i, score in enumerate(bm25_scores):
+                    if score > 12.0: # BM25 的绝对分数没有固定上限，但 > 12 通常意味着有很强的关键词重叠
+                        prev_note = self._get_note_by_doc_idx(i)
+                        if prev_note and prev_note.id != note.id:
+                            self.graph_edges.append({
+                                "src_id": note.id,
+                                "tgt_id": prev_note.id,
+                                "weight": 0.9, # 强边
+                                "type": "lexical_shared"
+                            })
+                            if prev_note.id not in note.id_based_links:
+                                note.id_based_links.append(prev_note.id)
+                            if note.id not in prev_note.id_based_links:
+                                prev_note.id_based_links.append(note.id)
+            except Exception as e:
+                pass
+                
     def _build_networkx_graph(self):
         """
         将 self.graph_edges 转成 networkx 无向加权图，供社区检测使用。
+        在边权聚合时，增强因果和实体共现的聚类亲和力。
 
         返回:
             nx.Graph 对象
@@ -1699,23 +1934,51 @@ class AgenticMemorySystem:
         for note_id in self.memories:
             G.add_node(note_id)
 
-        # 添加边（同向去重，取最大权重）
+        # 添加边（同向去重，累加不同维度的亲和力而不是单纯取最大）
         edge_map: Dict[Tuple[str, str], float] = {}
         for e in self.graph_edges:
             src, tgt, w = e["src_id"], e["tgt_id"], e["weight"]
-            if src not in self.memories or tgt not in self.memories:
+            rel_type = e.get("type", "semantic")
+            
+            # 这里需要兼容 entity 节点：只有以 "ent:" 开头或者是有效 memory 时才添加
+            src_valid = src.startswith("ent:") or src in self.memories
+            tgt_valid = tgt.startswith("ent:") or tgt in self.memories
+            
+            if not src_valid or not tgt_valid:
                 continue
+                
+            # 添加节点（如果是 entity，之前没加过的话在这里顺带加上）
+            if src.startswith("ent:"): G.add_node(src)
+            if tgt.startswith("ent:"): G.add_node(tgt)
+                
+            # 为聚集赋予不同权重：强逻辑关系更容易被划分到同一个社区
+            type_clustering_weight = {
+                "causes": 1.5,
+                "results_in": 1.5,
+                "temporal_entity_evolution": 1.2,
+                "entity_shared": 1.0,
+                "lexical_shared": 1.0, # 补充 BM25 连边的聚类权重
+                "contains_entity": 0.8, # 让共享实体的 note 通过 entity 节点聚集
+                "semantic": 0.8,
+                "temporal_adjacent": 0.3 # 弱关联
+            }
+            
+            w_adj = w * type_clustering_weight.get(rel_type, 1.0)
+            
             key = (min(src, tgt), max(src, tgt))
-            edge_map[key] = max(edge_map.get(key, 0.0), w)
+            # 修改：同节点对的多种关系应该叠加以加强亲和力，而非单纯取最大
+            edge_map[key] = min(edge_map.get(key, 0.0) + w_adj, 2.0) # 封顶2.0防极端
 
         for (src, tgt), w in edge_map.items():
-            G.add_edge(src, tgt, weight=w)
+            if w > 0:
+                G.add_edge(src, tgt, weight=w)
 
         return G
 
     def _run_community_detection(self, G) -> Dict[str, int]:
         """
-        在图 G 上运行 Louvain 社区检测（增加节点密度自适应）。
+        在图 G 上运行 Leiden 社区检测（Louvain 的后继算法）。
+        Leiden 保证社区内部严格连通，且支持 seed 参数确保结果可复现。
 
         参数:
             G: networkx.Graph 对象
@@ -1724,36 +1987,48 @@ class AgenticMemorySystem:
             {note_id: community_int} 映射字典
         """
         try:
-            import community as community_louvain
+            import leidenalg
+            import igraph as ig
         except ImportError:
             raise ImportError(
-                "python-louvain 未安装，请运行: pip install python-louvain"
+                "leidenalg / igraph 未安装，请运行: pip install leidenalg igraph"
             )
 
         if len(G.nodes) == 0:
             return {}
-            
+
         # 1. 运行时密度监测 (Weighted Average Degree)
         total_weight = G.size(weight='weight')
         num_nodes = len(G.nodes)
         avg_degree = (2.0 * total_weight) / num_nodes if num_nodes > 0 else 0
-        
-        # 2. 动态参数热计算
+
+        # 2. 动态 resolution 计算（与原 Louvain 版本相同公式，保持连续性）
+        import math
         d_base = 3.0
         alpha = 0.5
-        import math
         if avg_degree > 0:
             resolution = 1.0 + alpha * math.log(1 + max(0, avg_degree - d_base) / d_base)
         else:
             resolution = 1.0
-            
-        # 边界截断保护
         resolution = max(0.5, min(2.5, resolution))
 
-        # 孤立节点（无边）也可被 Louvain 分配到单独社区
-        # 注意：python-louvain 的 best_partition 不支持 random_state 参数
-        partition = community_louvain.best_partition(G, weight="weight", resolution=resolution)
-        return partition   # {node_id_str: community_int}
+        # 3. networkx → igraph 转换
+        # node_list 保证 index → node_id 的映射顺序
+        node_list = list(G.nodes())
+        ig_graph = ig.Graph.from_networkx(G)
+        weights = ig_graph.es['weight'] if ig_graph.ecount() > 0 else None
+
+        # 4. Leiden 聚类（seed=42 保证可复现）
+        partition = leidenalg.find_partition(
+            ig_graph,
+            leidenalg.RBConfigurationVertexPartition,
+            weights=weights,
+            seed=42,
+            resolution_parameter=resolution,
+        )
+
+        # 5. 映射回 {node_id_str: community_int}
+        return {node_list[i]: comm for i, comm in enumerate(partition.membership)}
 
     def _generate_community_summary(
         self, community_id: str, member_ids: List[str]
@@ -1809,9 +2084,7 @@ Respond strictly in valid JSON format matching the required schema."""
                         "keywords": {
                             "type": "array", 
                             "items": {"type": "string"},
-                            "minItems": 5,
-                            "maxItems": 10,
-                            "uniqueItems": True
+                            "description": "Provide exactly 5 to 10 representative keywords."
                         },
                     },
                     "required": ["title", "summary", "keywords"],
@@ -1835,6 +2108,8 @@ Respond strictly in valid JSON format matching the required schema."""
             keywords = parsed.get("keywords", [])
         except Exception as e:
             print(f"⚠ 社区摘要生成失败 ({community_id}): {e}")
+            if 'raw' in locals():
+                print(f"LLM 原始输出: {raw}")
 
         # 对摘要文本生成 embedding
         embedding = None
@@ -1899,8 +2174,10 @@ Respond strictly in valid JSON format matching the required schema."""
 
         # Step 3: 按社区 id 分组
         community_groups: Dict[int, List[str]] = {}
-        for note_id, comm_int in partition.items():
-            community_groups.setdefault(comm_int, []).append(note_id)
+        for node_id, comm_int in partition.items():
+            # 只有真实的 memory node 才参与社区摘要生成，entity 节点只是为了辅助聚类
+            if not node_id.startswith("ent:"):
+                community_groups.setdefault(comm_int, []).append(node_id)
 
         # Step 4: 为每个社区生成摘要
         new_communities: Dict[str, CommunitySummary] = {}
@@ -1986,8 +2263,7 @@ Respond strictly in valid JSON format matching the required schema."""
         """
         # Step 1: 原生 Local Search
         indices = self._retrieve_indices(query, k)
-        all_memories = list(self.memories.values())
-        related_notes = [all_memories[i] for i in indices if i < len(all_memories)]
+        related_notes = [self._get_note_by_doc_idx(i) for i in indices if self._get_note_by_doc_idx(i)]
 
         # Step 2: 收集这些 notes 涉及的社区
         involved_community_ids = set()
@@ -2002,9 +2278,10 @@ Respond strictly in valid JSON format matching the required schema."""
         # Step 3: 格式化社区背景
         community_context = ""
         for cs in involved_communities:
+            kws_str = ", ".join(cs.keywords[:5]) if cs.keywords else "无"
             community_context += (
                 f"【{cs.title}】{cs.summary} "
-                f"(涉及关键词: {', '.join(cs.keywords[:5])})\n"
+                f"(涉及关键词: {kws_str})\n"
             )
 
         return {
@@ -2035,7 +2312,8 @@ Output JUST the hypothetical answer text, nothing else."""
                 response_format={"type": "text"},
                 temperature=0.7
             )
-            return hyde_doc.strip()
+            # Combine the query and the hypothetical document for a richer embedding
+            return f"{query} {hyde_doc.strip()}"
         except Exception as e:
             print(f"⚠ HyDE generation failed: {e}. Falling back to original query.")
             return query
@@ -2067,25 +2345,90 @@ Output JUST the hypothetical answer text, nothing else."""
                     
         return target_ids
 
-    def _ppr_walk(self, seed_ids: list, damping: float = 0.8, max_hops: int = 2) -> dict:
+    def _ppr_walk(self, seed_ids: list, query: str = "", damping: float = 0.8, max_hops: int = 2) -> dict:
         """
         [PPR Multi-hop] 个性化页面排名（多跳漫游）
-        从种子节点出发，利用 semantic, temporal, Jaccard 图边扩展隐藏线索。
+        从种子节点出发，利用 semantic, temporal, Jaccard 及 LLM 提取的因果时序等图边扩展隐藏线索。
+        引入 Query 意图感知：根据 query 内容动态调整边权重。
         """
         from collections import defaultdict
         scores = defaultdict(float)
+        
+        # 简单 Query 意图探测（词汇级触发）
+        q_lower = query.lower()
+        find_cause = any(w in q_lower for w in ["why", "cause", "reason", "because", "how come", "导致", "原因", "为什么", "起因"])
+        find_effect = any(w in q_lower for w in ["result", "effect", "outcome", "happen next", "then", "结果", "影响", "导致了", "接下来"])
         
         # 种子节点初始分数
         for sid in seed_ids:
             scores[sid] = 1.0
             
-        # 预加载无向图邻接表
+        # 预加载邻接表，支持多关系和有向权重差异化
         adj = defaultdict(lambda: defaultdict(float))
+        
+        # 基础关系权重乘子
+        type_multipliers = {
+            "causes": 1.5,
+            "results_in": 1.5,
+            "happens_before": 1.2,
+            "happens_after": 1.2,
+            "temporal_entity_evolution": 1.2,
+            "semantic": 1.0,
+            "temporal_adjacent": 0.8,
+            "entity_shared": 0.8,
+            "lexical_shared": 1.2, # BM25 强匹配的专有名词
+            "similar_to": 1.0,
+            "llm_inferred": 1.2
+        }
+
         for edge in self.graph_edges:
             src, tgt, w = edge.get("src_id"), edge.get("tgt_id"), edge.get("weight", 0.1)
-            # 无向图，保存最大权重
-            adj[src][tgt] = max(adj[src][tgt], w)
-            adj[tgt][src] = max(adj[tgt][src], w)
+            rel_type = edge.get("type", "semantic")
+            
+            multiplier = type_multipliers.get(rel_type, 1.0)
+            
+            # 【方案4】基于时间差的衰减因子
+            # 只有当两个端点都是 MemoryNote 且有时间戳时才计算
+            time_decay = 1.0
+            if src in self.memories and tgt in self.memories:
+                src_note, tgt_note = self.memories[src], self.memories[tgt]
+                if src_note.timestamp and tgt_note.timestamp and len(src_note.timestamp) >= 8 and len(tgt_note.timestamp) >= 8:
+                    try:
+                        import math
+                        from datetime import datetime
+                        # 简化计算：只比较天数差异。YYYYMMDD
+                        src_day = datetime.strptime(src_note.timestamp[:8], "%Y%m%d")
+                        tgt_day = datetime.strptime(tgt_note.timestamp[:8], "%Y%m%d")
+                        diff_days = abs((src_day - tgt_day).days)
+                        # 指数衰减：半衰期约 7 天 (e^-0.1*7 ≈ 0.5)
+                        time_decay = max(0.2, math.exp(-0.1 * diff_days))
+                    except ValueError:
+                        pass
+            
+            adjusted_w = w * multiplier * time_decay
+            
+            # Query-Aware 动态有向权重衰减
+            if rel_type in ["causes", "results_in"]:
+                # 如果查询在找原因，那么“溯源”方向（即从结果往起因跳）不应该被过度衰减
+                forward_decay = 1.0
+                backward_decay = 0.5
+                if find_cause and rel_type == "causes": # src causes tgt. src is cause. tgt to src should be strong.
+                    forward_decay, backward_decay = 0.5, 1.2
+                elif find_effect and rel_type == "causes":
+                    forward_decay, backward_decay = 1.2, 0.3
+                    
+                adj[src][tgt] = max(adj[src][tgt], adjusted_w * forward_decay)
+                adj[tgt][src] = max(adj[tgt][src], adjusted_w * backward_decay)
+                
+            elif rel_type in ["happens_before", "temporal_entity_evolution"]:
+                forward_decay, backward_decay = 1.0, 0.5
+                if find_cause: # 找原因往往要往过去找
+                    forward_decay, backward_decay = 0.6, 1.2
+                adj[src][tgt] = max(adj[src][tgt], adjusted_w * forward_decay)
+                adj[tgt][src] = max(adj[tgt][src], adjusted_w * backward_decay)
+            else:
+                adj[src][tgt] = max(adj[src][tgt], adjusted_w)
+                adj[tgt][src] = max(adj[tgt][src], adjusted_w)
             
         current_frontier = set(seed_ids)
         for hop in range(1, max_hops + 1):
@@ -2094,32 +2437,55 @@ Output JUST the hypothetical answer text, nothing else."""
                 current_score = scores[node]
                 for neighbor, weight in adj[node].items():
                     # 传播得分: 节点现有得分 * 边权重 * 衰减率
-                    propagated = current_score * float(weight) * damping
+                    # 限制单次传播的最大比例，防止得分无限放大导致远距离节点反超种子节点
+                    effective_weight = min(float(weight), 1.2)
+                    propagated = current_score * effective_weight * damping
+                    
+                    # 取历史得分和传播得分的较大值，但为了避免得分无限制膨胀，增加对种子节点的降级约束
                     if propagated > scores[neighbor]:
-                        scores[neighbor] = propagated
-                        next_frontier.add(neighbor)
+                        # 强迫非种子节点（或者传播过程中）的得分严格小于或等于源节点，确保符合漫游衰减规律
+                        capped_propagated = min(propagated, current_score * 0.95)
+                        if capped_propagated > scores[neighbor]:
+                            scores[neighbor] = capped_propagated
+                            next_frontier.add(neighbor)
             current_frontier = next_frontier
             
         return dict(scores)
 
-    def find_related_memories_advanced(self, query: str, k: int = 5) -> Dict[str, Any]:
+    def find_related_memories_advanced(
+        self,
+        query: str,
+        k: int = 5,
+        include_community_context: bool = True,
+        max_hops: int = 2,
+        alpha: float = 0.5,
+        use_hyde: bool = False,
+    ) -> Dict[str, Any]:
         """
-        终极检索演进管道：HyDE + Community Filter + BGE-M3 + PPR Walk
+        终极检索演进管道：Community Filter + BGE-M3 + PPR Walk
         返回含有丰富线索组合的综合证据字典。
         完全兼容原有的返回结构。
+
+        use_hyde: 是否启用 HyDE 假设文档扩展。
+                  对话记忆封闭世界检索默认关闭（LLM 无法预知私有事件的具体细节，
+                  生成的假设文档会引入幻觉偏移）；仅在开放域复杂推理场景下考虑开启。
         """
         all_memories_list = list(self.memories.values())
         if not all_memories_list:
              return {"notes": [], "community_context": "", "communities": []}
-             
-        # 1. HyDE
-        hyde_doc = self._generate_hyde_query(query)
-        
+
+        # 1. HyDE（默认关闭：对话记忆为封闭世界，假设文档会引入幻觉偏移）
+        if use_hyde:
+            hyde_doc = self._generate_hyde_query(query)
+        else:
+            hyde_doc = query
+
         # 2. Vectorize
         query_emb = self.retriever.model.encode([hyde_doc])
         
         # 3. Community Filter
-        allowed_ids = self._community_filter(query_emb, top_c=2)
+        # 稍微放宽 top_c 以减少漏网之鱼，并将硬过滤完全变为软过滤
+        allowed_ids = self._community_filter(query_emb, top_c=3)
         
         # 4. Dense 精搜种子节点
         scores = self.retriever.get_scores_by_emb(query_emb[0])
@@ -2129,39 +2495,78 @@ Output JUST the hypothetical answer text, nothing else."""
             
         seed_scores = []
         for i, doc_str in enumerate(self.retriever.corpus):
-            # 确保下标在字典范围内
-            if i < len(all_memories_list):
-                mem = all_memories_list[i]
-                if allowed_ids is None or mem.id in allowed_ids:
-                    seed_scores.append((mem.id, scores[i]))
+            mem = self._get_note_by_doc_idx(i)
+            if mem:
+                score = float(scores[i])
+                # 将社区过滤改为软过滤（加分），避免硬过滤导致高相关性节点丢失
+                if allowed_ids is not None and mem.id in allowed_ids:
+                    score += 0.15 # 提高社区加分权重，引导聚类但不仅限于聚类
+                seed_scores.append((mem.id, score))
                     
         # 提取 Top-K 种子
         seed_scores.sort(key=lambda x: x[1], reverse=True)
-        top_seeds = [t[0] for t in seed_scores[:k]]
+        # 控制种子规模，避免 PPR 扩散过度带来噪声
+        seed_cap = min(max(k, 16), 32)
+        top_seeds = [t[0] for t in seed_scores[:seed_cap]]
         
-        # 5. PPR 多跳
+        # 5. PPR 多跳（可按题型降 hop，减少噪音扩散）
         if top_seeds:
-            ppr_results = self._ppr_walk(top_seeds, damping=0.8, max_hops=2)
+            ppr_results = self._ppr_walk(
+                top_seeds,
+                query=query,
+                damping=0.8,
+                max_hops=max(0, int(max_hops)),
+            )
         else:
             ppr_results = {}
             
-        # 6. 合并收网 (过滤掉得分过低的节点)
-        final_list = []
-        for mid, sc in ppr_results.items():
-            if mid in self.memories and sc > 0.1:
-                final_list.append((self.memories[mid], sc))
-                
+        # 6. 合并收网 (动态归一化融合 Dense Score 和 PPR Score)
+        # 建立 Dense 得分字典，仅考虑种子节点和PPR走到的节点，减少计算量
+        candidate_ids = set(top_seeds) | set(ppr_results.keys())
+        dense_scores_dict = {mem_id: sc for mem_id, sc in seed_scores if mem_id in candidate_ids}
+        
+        # 获取分数的 Min-Max 以便归一化
+        def min_max_norm(score_dict):
+            if not score_dict:
+                return {}
+            vals = list(score_dict.values())
+            min_v, max_v = min(vals), max(vals)
+            if max_v - min_v < 1e-6:
+                return {k: 1.0 for k in score_dict}
+            return {k: (v - min_v) / (max_v - min_v) for k, v in score_dict.items()}
+            
+        norm_dense = min_max_norm(dense_scores_dict)
+        norm_ppr = min_max_norm(ppr_results)
+        
+        # 融合打分 S_final = alpha * Dense + (1-alpha) * PPR
+        alpha = max(0.0, min(1.0, float(alpha)))
+        fused_scores = {}
+        
+        for mid in candidate_ids:
+            if mid not in self.memories:
+                continue
+            # 修正未命中时的默认得分。因为min_max_norm的最小值为0，所以未命中的节点应得0.0而不是0.05
+            d_score = norm_dense.get(mid, 0.0)
+            p_score = norm_ppr.get(mid, 0.0)
+            
+            fused_scores[mid] = alpha * d_score + (1 - alpha) * p_score
+            
+        final_list = [(self.memories[mid], sc) for mid, sc in fused_scores.items() if sc > 0.01]
         final_list.sort(key=lambda x: x[1], reverse=True)
-        related_notes = [x[0] for x in final_list[:k*2]] # 留多点证据给后续的Reflection验证
+        
+        # 限制最终注入给生成模型的证据条数，避免长上下文导致答案漂移
+        # 原来 k*2 在 k=24 时注入 32 条，对 qwen 系列小模型上下文过长反而导致答案漂移
+        note_cap = min(k, 20)
+        related_notes = [x[0] for x in final_list[:note_cap]]
         
         # 如果依然不够，回退填充
-        if len(related_notes) < k and seed_scores:
-             existing_ids = set(n.id for n in related_notes)
-             for t in seed_scores:
-                 if t[0] not in existing_ids and t[0] in self.memories:
-                     related_notes.append(self.memories[t[0]])
-                 if len(related_notes) >= k*2:
-                     break
+        if len(related_notes) < note_cap and seed_scores:
+            existing_ids = set(n.id for n in related_notes)
+            for t in seed_scores:
+                if t[0] not in existing_ids and t[0] in self.memories:
+                    related_notes.append(self.memories[t[0]])
+                if len(related_notes) >= note_cap:
+                    break
                      
         # 7. 拼接社区语境 (Community Context)
         involved_community_ids = set()
@@ -2169,14 +2574,16 @@ Output JUST the hypothetical answer text, nothing else."""
             if note.community_id and note.community_id in self.communities:
                 involved_community_ids.add(note.community_id)
 
-        involved_communities = [self.communities[cid] for cid in involved_community_ids]
+        involved_communities = [self.communities[cid] for cid in involved_community_ids] if include_community_context else []
 
         community_context = ""
-        for cs in involved_communities:
-            community_context += (
-                f"【{cs.title}】{cs.summary} "
-                f"(涉及关键词: {', '.join(cs.keywords[:5])})\n"
-            )
+        if include_community_context:
+            for cs in involved_communities:
+                kws_str = ", ".join(cs.keywords[:5]) if cs.keywords else "无"
+                community_context += (
+                    f"【{cs.title}】{cs.summary} "
+                    f"(涉及关键词: {kws_str})\n"
+                )
 
         return {
             "notes": related_notes,
@@ -2233,26 +2640,36 @@ Output JUST the hypothetical answer text, nothing else."""
             with open(edges_path, "r", encoding="utf-8") as f:
                 self.graph_edges = json.load(f)
 
-        # 加载社区摘要
-        communities_path = save_path / "communities.json"
-        if communities_path.exists():
-            with open(communities_path, "r", encoding="utf-8") as f:
-                raw = json.load(f)
-            self.communities = {
-                cid: CommunitySummary.from_dict(d) for cid, d in raw.items()
-            }
-
         # 加载社区 embeddings
         emb_path = save_path / "community_embeddings.npy"
         if emb_path.exists():
             self.community_embeddings = np.load(str(emb_path))
 
-        # 加载 meta
+        # 加载社区摘要
+        communities_path = save_path / "communities.json"
+        if communities_path.exists():
+            with open(communities_path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            self.communities = {}
+            for cid, d in raw.items():
+                cs = CommunitySummary.from_dict(d)
+                # 恢复 embedding 到 CommunitySummary 对象中
+                if self.community_embeddings is not None and "community_ids_list" in locals():
+                     pass # handled below after loading meta
+                self.communities[cid] = cs
+
+        # 加载 meta 并恢复每个社区对象的 embedding 引用
         meta_path = save_path / "graph_meta.json"
         if meta_path.exists():
             with open(meta_path, "r", encoding="utf-8") as f:
                 meta = json.load(f)
             self.community_ids_list = meta.get("community_ids_list", [])
+            
+            # 将 numpy array 形式的 embedding 分配回对应的 CommunitySummary
+            if self.community_embeddings is not None and len(self.community_ids_list) == self.community_embeddings.shape[0]:
+                for i, cid in enumerate(self.community_ids_list):
+                    if cid in self.communities:
+                        self.communities[cid].embedding = self.community_embeddings[i]
 
         print(
             f"✅ GraphRAG 状态已加载："
