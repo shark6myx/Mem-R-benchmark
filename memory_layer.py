@@ -628,6 +628,7 @@ class CommunitySummary:
     keywords: List[str] = field(default_factory=list)
     embedding: Optional[Any] = None         # summary 的向量（np.ndarray）
     updated_at: str = ""
+    evolution_history: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         """序列化（不含 embedding，embedding 单独存）"""
@@ -639,6 +640,7 @@ class CommunitySummary:
             "summary": self.summary,
             "keywords": self.keywords,
             "updated_at": self.updated_at,
+            "evolution_history": self.evolution_history,
         }
 
     @classmethod
@@ -651,6 +653,7 @@ class CommunitySummary:
             summary=d.get("summary", ""),
             keywords=d.get("keywords", []),
             updated_at=d.get("updated_at", ""),
+            evolution_history=d.get("evolution_history", []),
         )
 
 
@@ -2141,24 +2144,63 @@ Respond strictly in valid JSON format matching the required schema."""
             updated_at=datetime.now().strftime("%Y%m%d%H%M"),
         )
 
+    def _match_old_communities(
+        self,
+        old_communities: Dict[str, "CommunitySummary"],
+        new_member_groups: Dict[str, List[str]],
+    ) -> Dict[str, str]:
+        """
+        用 Jaccard 相似度将新社区映射到最相近的旧社区。
+
+        参数:
+            old_communities: 重建前的 self.communities 快照
+            new_member_groups: {new_community_id -> member_note_ids}
+
+        返回:
+            {new_community_id -> old_community_id}（无匹配则不含该键）
+        """
+        matches: Dict[str, str] = {}
+        for new_cid, new_members in new_member_groups.items():
+            new_set = set(new_members)
+            if not new_set:
+                continue
+            best_old_cid, best_score = None, 0.0
+            for old_cid, old_cs in old_communities.items():
+                old_set = set(old_cs.member_note_ids)
+                if not old_set:
+                    continue
+                intersection = len(new_set & old_set)
+                union = len(new_set | old_set)
+                jaccard = intersection / union if union > 0 else 0.0
+                if jaccard > best_score:
+                    best_score = jaccard
+                    best_old_cid = old_cid
+            if best_old_cid is not None and best_score >= 0.3:
+                matches[new_cid] = best_old_cid
+        return matches
+
     def rebuild_communities(self) -> None:
         """
         GraphRAG 社区重建：
           1. 构建 networkx 图
-          2. 运行 Louvain 社区检测
+          2. 运行 Leiden 社区检测
           3. 为每个社区生成 LLM 摘要
           4. 更新 self.communities 和 community_embeddings
+          5. 记录社区演化历史（evolution_history）
 
         会自动更新每条 note 的 community_id 字段。
         """
         if len(self.memories) < 2:
             return
-            
+
         if not self._graph_is_dirty and len(self.communities) > 0:
             print(f"⏩ GraphRAG: 图结构未变脏，跳过社区重建")
             return
 
         print(f"🔄 GraphRAG: 重建社区（共 {len(self.memories)} 条记忆）...")
+
+        # 快照旧社区，用于演化 diff
+        old_communities: Dict[str, CommunitySummary] = dict(self.communities)
 
         # Step 1: 建图
         try:
@@ -2177,14 +2219,25 @@ Respond strictly in valid JSON format matching the required schema."""
         if not partition:
             return
 
-        # Step 3: 按社区 id 分组
+        # Step 3: 按社区 id 分组（排除 entity 虚拟节点）
         community_groups: Dict[int, List[str]] = {}
         for node_id, comm_int in partition.items():
-            # 只有真实的 memory node 才参与社区摘要生成，entity 节点只是为了辅助聚类
             if not node_id.startswith("ent:"):
                 community_groups.setdefault(comm_int, []).append(node_id)
 
-        # Step 4: 为每个社区生成摘要
+        # 构建 new_cid -> member_ids 映射（用于匹配和 diff 计算）
+        new_member_groups: Dict[str, List[str]] = {
+            f"comm_{comm_int:04d}": member_ids
+            for comm_int, member_ids in community_groups.items()
+        }
+
+        # Step 4: 将新社区匹配到旧社区（用于演化追踪）
+        cid_to_old = self._match_old_communities(old_communities, new_member_groups)
+
+        rebuild_ts = datetime.now().strftime("%Y%m%d%H%M")
+        total_notes = len(self.memories)
+
+        # Step 5: 为每个社区生成摘要并记录演化历史
         new_communities: Dict[str, CommunitySummary] = {}
         all_embeddings = []
         cid_order = []
@@ -2199,28 +2252,53 @@ Respond strictly in valid JSON format matching the required schema."""
 
             # 生成摘要
             cs = self._generate_community_summary(community_id, member_ids)
+
+            # 计算演化 diff
+            old_cid = cid_to_old.get(community_id)
+            if old_cid and old_cid in old_communities:
+                old_cs = old_communities[old_cid]
+                old_set = set(old_cs.member_note_ids)
+                new_set = set(member_ids)
+                evolution_entry = {
+                    "timestamp": rebuild_ts,
+                    "total_notes": total_notes,
+                    "added_note_ids": sorted(new_set - old_set),
+                    "removed_note_ids": sorted(old_set - new_set),
+                    "prev_title": old_cs.title,
+                }
+                cs.evolution_history = old_cs.evolution_history + [evolution_entry]
+            else:
+                # 新出现的社区，记录首次创建
+                cs.evolution_history = [{
+                    "timestamp": rebuild_ts,
+                    "total_notes": total_notes,
+                    "added_note_ids": sorted(member_ids),
+                    "removed_note_ids": [],
+                    "prev_title": "",
+                }]
+
             new_communities[community_id] = cs
 
             if cs.embedding is not None:
                 all_embeddings.append(cs.embedding)
                 cid_order.append(community_id)
 
-        # Step 5: 更新类属性
+        # Step 6: 更新类属性
         self.communities = new_communities
         self.community_ids_list = cid_order
         if all_embeddings:
             self.community_embeddings = np.stack(all_embeddings, axis=0)
         else:
             self.community_embeddings = None
-            
+
         # 重建完成后，重置脏标记
         self._graph_is_dirty = False
 
-        print(
-            f"✅ GraphRAG: 社区重建完成，共 {len(new_communities)} 个社区："
-        )
+        print(f"✅ GraphRAG: 社区重建完成，共 {len(new_communities)} 个社区：")
         for cid, cs in new_communities.items():
-            print(f"   [{cid}] {cs.title} ({len(cs.member_note_ids)} 条记忆)")
+            n_added = len(cs.evolution_history[-1]["added_note_ids"]) if cs.evolution_history else 0
+            n_removed = len(cs.evolution_history[-1]["removed_note_ids"]) if cs.evolution_history else 0
+            print(f"   [{cid}] {cs.title} ({len(cs.member_note_ids)} 条记忆, +{n_added}/-{n_removed})")
 
     def find_community_context(self, query: str, k: int = 3) -> List[CommunitySummary]:
         """
