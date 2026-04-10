@@ -2158,6 +2158,10 @@ Respond strictly in valid JSON format matching the required schema."""
 
         返回:
             {new_community_id -> old_community_id}（无匹配则不含该键）
+
+        注意：无唯一性约束，同一旧社区可被多个新社区匹配（社区分裂场景）。
+        此时被分裂的 notes 会同时出现在多个新社区的 added_note_ids 中，
+        也会出现在对方的 removed_note_ids 里（相对旧社区集合的 diff 是正确的）。
         """
         matches: Dict[str, str] = {}
         for new_cid, new_members in new_member_groups.items():
@@ -2171,7 +2175,7 @@ Respond strictly in valid JSON format matching the required schema."""
                     continue
                 intersection = len(new_set & old_set)
                 union = len(new_set | old_set)
-                jaccard = intersection / union if union > 0 else 0.0
+                jaccard = intersection / union  # both sets non-empty, union >= 1
                 if jaccard > best_score:
                     best_score = jaccard
                     best_old_cid = old_cid
