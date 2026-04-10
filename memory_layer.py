@@ -2013,19 +2013,24 @@ class AgenticMemorySystem:
         resolution = max(0.5, min(2.5, resolution))
 
         # 3. networkx → igraph 转换
-        # node_list 保证 index → node_id 的映射顺序
-        node_list = list(G.nodes())
+        # 必须在转换后从 igraph 取顶点名，而非事先用 list(G.nodes())，
+        # 因为 ig.Graph.from_networkx 内部顶点顺序不保证与 nx 迭代顺序一致
         ig_graph = ig.Graph.from_networkx(G)
+        node_list = ig_graph.vs["_nx_name"]   # igraph 保存原始 NX 节点键
         weights = ig_graph.es['weight'] if ig_graph.ecount() > 0 else None
 
         # 4. Leiden 聚类（seed=42 保证可复现）
-        partition = leidenalg.find_partition(
-            ig_graph,
-            leidenalg.RBConfigurationVertexPartition,
-            weights=weights,
-            seed=42,
-            resolution_parameter=resolution,
-        )
+        try:
+            partition = leidenalg.find_partition(
+                ig_graph,
+                leidenalg.RBConfigurationVertexPartition,
+                weights=weights,
+                seed=42,
+                resolution_parameter=resolution,
+            )
+        except (ValueError, RuntimeError) as e:
+            print(f"⚠ Leiden 聚类失败（{e}），跳过社区重建")
+            return {}
 
         # 5. 映射回 {node_id_str: community_int}
         return {node_list[i]: comm for i, comm in enumerate(partition.membership)}
