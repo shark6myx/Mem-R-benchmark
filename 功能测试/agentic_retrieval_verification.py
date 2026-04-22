@@ -1,5 +1,22 @@
 import os
+from openai import OpenAI
 from memory_layer import LLMController, AgenticMemorySystem, AgenticDecomposer, ReflectionVerifier
+
+
+def _resolve_vllm_model(api_base: str, api_key: str, fallback: str) -> str:
+    env_model = os.getenv("VLLM_MODEL")
+    if env_model:
+        return env_model
+    try:
+        client = OpenAI(api_key=api_key, base_url=api_base)
+        models = client.models.list()
+        for m in getattr(models, "data", []) or []:
+            model_id = getattr(m, "id", None)
+            if model_id:
+                return model_id
+    except Exception:
+        return fallback
+    return fallback
 
 def check_agentic_decomposition():
     print("=== Testing Agentic Decomposition Pipeline ===")
@@ -7,9 +24,14 @@ def check_agentic_decomposition():
     # 1. Initialize Memory System with test configuration
     print("\n[1] Initializing AgenticMemorySystem...")
     try:
+        api_base = os.getenv("VLLM_API_BASE", "http://localhost:8004/v1")
+        api_key = os.getenv("VLLM_API_KEY", "asdasdasd")
+        llm_model = _resolve_vllm_model(api_base, api_key, fallback="qwen3_5-flash")
         memory_sys = AgenticMemorySystem(
-            llm_backend="openai",
-            llm_model="gpt-4o-mini"
+            llm_backend="vllm",
+            llm_model=llm_model,
+            api_base=api_base,
+            api_key=api_key,
         )
         print("✓ MemorySystem initialized successfully.")
     except Exception as e:

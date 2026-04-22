@@ -1,0 +1,6 @@
+{
+    "python.defaultInterpreterPath": "E:\\anaconda\\python.exe",
+    "python.terminal.activateEnvironment": false,
+    "python.analysis.autoImportCompletions": true,
+    "cursorpyright.analysis.autoImportCompletions": true
+}

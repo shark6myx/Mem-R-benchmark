@@ -1,0 +1,6 @@
+Looking in indexes: https://pypi.tuna.tsinghua.edu.cn/simple
+Requirement already satisfied: requests in /home/myx/miniconda3/envs/Mem-R/lib/python3.9/site-packages (2.32.5)
+Requirement already satisfied: charset_normalizer<4,>=2 in /home/myx/miniconda3/envs/Mem-R/lib/python3.9/site-packages (from requests) (3.4.7)
+Requirement already satisfied: idna<4,>=2.5 in /home/myx/miniconda3/envs/Mem-R/lib/python3.9/site-packages (from requests) (3.11)
+Requirement already satisfied: urllib3<3,>=1.21.1 in /home/myx/miniconda3/envs/Mem-R/lib/python3.9/site-packages (from requests) (2.6.3)
+Requirement already satisfied: certifi>=2017.4.17 in /home/myx/miniconda3/envs/Mem-R/lib/python3.9/site-packages (from requests) (2026.2.25)

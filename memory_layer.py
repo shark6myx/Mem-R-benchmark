@@ -18,6 +18,16 @@ import json as json_lib
 import time
 import torch
 import sys
+import re
+
+from evidence_program import AnswerStyle, EvidenceProgram, ExecutionTrace, ProgramType
+from model_cache_utils import load_sentence_transformer
+from reranker_utils import load_reranker
+from retrieval_types import EvidenceSubgraph, RetrievalEngine, RetrievalResult
+
+MEMORY_TEXT_SCHEMA_VERSION = 2
+RETRIEVER_CACHE_VERSION = 2
+GRAPH_CACHE_VERSION = 2
 
 
 def _should_retry_openai_exception(exc: BaseException) -> bool:
@@ -498,13 +508,184 @@ class MemoryNote:
         self.context = context or "General"
         if isinstance(self.context, list):
             self.context = " ".join(self.context)  # 将列表转换为字符串
-            
+
         self.evolution_history = evolution_history or []
         self.category = category or "Uncategorized"
         self.tags = tags or []
+        self.text_schema_version = MEMORY_TEXT_SCHEMA_VERSION
         # GraphRAG: community membership and stable id-based links
         self.community_id: Optional[str] = None
         self.id_based_links: List[str] = []  # stores note.id strings (not position indices)
+        self.normalize_metadata()
+
+    @staticmethod
+    def _extract_speaker_terms(content: str) -> set:
+        names = set()
+        for match in re.finditer(r"Speaker\s+([A-Za-z][A-Za-z0-9_-]*)\s+says", content or "", flags=re.IGNORECASE):
+            names.add(match.group(1).lower())
+        return names
+
+    @staticmethod
+    def _tokenize_terms(text: str) -> List[str]:
+        return re.findall(r"[A-Za-z][A-Za-z0-9_-]{1,}", (text or "").lower())
+
+    @classmethod
+    def _trim_text_to_budget(cls, text: str, max_chars: int) -> str:
+        text = (text or "").strip()
+        if len(text) <= max_chars:
+            return text
+        clipped = text[:max_chars].rstrip()
+        if " " in clipped:
+            clipped = clipped.rsplit(" ", 1)[0].rstrip()
+        return clipped.rstrip(" ,;:-")
+
+    @classmethod
+    def _compress_context_text(
+        cls,
+        context: Union[str, List[str], None],
+        content: str = "",
+        max_sentences: int = 2,
+        max_chars: int = 240,
+    ) -> str:
+        if isinstance(context, list):
+            raw = " ".join(str(item) for item in context if item)
+        else:
+            raw = str(context or "")
+        raw = raw.strip()
+        if not raw:
+            return "General"
+
+        raw = re.sub(r"\s*\|\s*Context:\s*", ". ", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"\bContext:\s*", "", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"\s+", " ", raw).strip(" |")
+        raw = re.sub(r"([.!?])\s*\.", r"\1", raw)
+        if not raw:
+            return "General"
+
+        fragments = [frag.strip(" |") for frag in re.split(r"(?<=[.!?])\s+|\s+\|\s+", raw) if frag.strip(" |")]
+        if not fragments:
+            fragments = [raw]
+
+        sentences: List[str] = []
+        seen = set()
+        for fragment in fragments:
+            cleaned = re.sub(r"\s+", " ", fragment).strip(" ,;:-")
+            norm = re.sub(r"[^a-z0-9]+", " ", cleaned.lower()).strip()
+            if not cleaned or not norm or norm in seen:
+                continue
+            seen.add(norm)
+            sentences.append(cleaned)
+
+        if not sentences:
+            return "General"
+
+        stopwords = {
+            "speaker", "says", "context", "content", "general", "about", "into", "from", "with", "that",
+            "this", "they", "them", "their", "there", "where", "when", "which", "while", "after", "before",
+            "because", "would", "could", "should", "have", "been", "were", "being", "also", "just", "like",
+        }
+        speaker_terms = cls._extract_speaker_terms(content)
+        content_terms = {
+            term for term in cls._tokenize_terms(content)
+            if len(term) >= 3 and term not in stopwords and term not in speaker_terms
+        }
+        sentence_terms = []
+        for sentence in sentences:
+            terms = {
+                term for term in cls._tokenize_terms(sentence)
+                if len(term) >= 3 and term not in stopwords
+            }
+            sentence_terms.append(terms)
+
+        selected_indices = [0]
+        used_terms = set(sentence_terms[0])
+        while len(selected_indices) < min(max_sentences, len(sentences)):
+            best_idx = None
+            best_score = -1.0
+            for idx in range(1, len(sentences)):
+                if idx in selected_indices:
+                    continue
+                overlap = len(sentence_terms[idx] & content_terms)
+                novelty = len(sentence_terms[idx] - used_terms)
+                score = overlap * 3.0 + novelty + max(0.0, 0.25 - (idx * 0.03))
+                if score > best_score:
+                    best_idx = idx
+                    best_score = score
+            if best_idx is None:
+                break
+            candidate_text = " ".join(sentences[i] for i in selected_indices + [best_idx]).strip()
+            if len(candidate_text) > max_chars:
+                break
+            selected_indices.append(best_idx)
+            used_terms |= sentence_terms[best_idx]
+
+        selected_text = " ".join(sentences[i] for i in selected_indices).strip()
+        selected_text = cls._trim_text_to_budget(selected_text, max_chars)
+        selected_text = re.sub(r"([.!?])\1+", r"\1", selected_text)
+        return selected_text or "General"
+
+    @classmethod
+    def _normalize_keywords(
+        cls,
+        keywords: Optional[List[str]],
+        content: str = "",
+        max_items: int = 6,
+    ) -> List[str]:
+        stopwords = {
+            "speaker", "says", "context", "content", "general", "today", "tomorrow", "yesterday",
+            "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+            "january", "february", "march", "april", "may", "june", "july", "august",
+            "september", "october", "november", "december",
+        }
+        speaker_terms = cls._extract_speaker_terms(content)
+        normalized: List[str] = []
+        seen = set()
+        for keyword in keywords or []:
+            cleaned = re.sub(r"\s+", " ", str(keyword or "")).strip(" ,;:-")
+            if not cleaned:
+                continue
+            norm = cleaned.lower()
+            if norm in seen or norm in stopwords or norm in speaker_terms:
+                continue
+            if not re.search(r"[A-Za-z]", cleaned):
+                continue
+            seen.add(norm)
+            normalized.append(cleaned)
+            if len(normalized) >= max_items:
+                break
+        return normalized
+
+    @classmethod
+    def _normalize_tags(
+        cls,
+        tags: Optional[List[str]],
+        keywords: Optional[List[str]] = None,
+        max_items: int = 8,
+    ) -> List[str]:
+        generic_tags = {
+            "conversation", "personal_interests", "personal interests", "social interaction",
+            "shared appreciation", "general", "context", "content", "discussion", "communication",
+        }
+        keyword_norms = {str(item).strip().lower() for item in keywords or [] if str(item).strip()}
+        normalized: List[str] = []
+        seen = set()
+        for tag in tags or []:
+            cleaned = re.sub(r"\s+", " ", str(tag or "")).strip(" ,;:-")
+            if not cleaned:
+                continue
+            norm = cleaned.lower()
+            if norm in seen or norm in generic_tags or norm in keyword_norms or len(norm) <= 2:
+                continue
+            seen.add(norm)
+            normalized.append(cleaned)
+            if len(normalized) >= max_items:
+                break
+        return normalized
+
+    def normalize_metadata(self) -> None:
+        self.context = self._compress_context_text(self.context, self.content)
+        self.keywords = self._normalize_keywords(self.keywords, self.content)
+        self.tags = self._normalize_tags(self.tags, self.keywords)
 
     @staticmethod
     def analyze_content(content: str, llm_controller: LLMController) -> Dict:
@@ -664,21 +845,75 @@ class HybridRetriever:
     使用 Dense 向量的语义检索器
     """
     
-    def __init__(self, model_name: str = 'BAAI/bge-m3'):
+    def __init__(self, model_name: str = 'BAAI/bge-m3', dense_weight: float = 0.75):
         """
         初始化语义检索器
         
         参数:
             model_name: 使用的SentenceTransformer模型名称
         """
-        self.model = SentenceTransformer(model_name)
+        self.model_name = model_name
+        self.model = load_sentence_transformer(model_name)
         self.corpus = []
+        self.dense_corpus = []
         self.embeddings = None
         self.document_ids = {}  # 文档内容到索引的映射
+        self.dense_weight = float(dense_weight)
         
         # ── 稀疏检索 (BM25) ──────────────────────────
         self.bm25 = None
         self.tokenized_corpus = []
+
+    def _tokenize_for_bm25(self, text: str) -> List[str]:
+        """尽量稳定地进行 BM25 分词，缺失 jieba 时回退到空格切词。"""
+        try:
+            import jieba
+            return list(jieba.cut(text))
+        except Exception:
+            return (text or "").lower().split()
+
+    def _min_max_norm_array(self, scores: np.ndarray) -> np.ndarray:
+        if scores is None or len(scores) == 0:
+            return np.array([])
+        scores = np.asarray(scores, dtype=float)
+        min_v = float(np.min(scores))
+        max_v = float(np.max(scores))
+        if max_v - min_v < 1e-8:
+            return np.ones_like(scores, dtype=float)
+        return (scores - min_v) / (max_v - min_v)
+
+    def get_hybrid_scores(self, query: str, query_embedding: Optional[np.ndarray] = None, dense_weight: Optional[float] = None) -> np.ndarray:
+        """
+        混合 Dense + BM25 分数。
+        如果 BM25 不可用，则自动退化为 Dense。
+        """
+        if self.embeddings is None or len(self.corpus) == 0:
+            return np.array([])
+
+        if query_embedding is None:
+            query_embedding = self.model.encode([query])
+            if hasattr(query_embedding, 'numpy'):
+                query_embedding = query_embedding.numpy()
+            if len(query_embedding.shape) == 2:
+                query_embedding = query_embedding[0]
+
+        dense_scores = self.get_scores_by_emb(query_embedding)
+        if len(dense_scores) == 0:
+            return np.array([])
+
+        dense_norm = self._min_max_norm_array(dense_scores)
+
+        if self.bm25 is None or not self.tokenized_corpus:
+            return dense_norm
+
+        query_tokens = self._tokenize_for_bm25(query)
+        bm25_scores = np.asarray(self.bm25.get_scores(query_tokens), dtype=float)
+        bm25_norm = self._min_max_norm_array(bm25_scores)
+
+        w_dense = self.dense_weight if dense_weight is None else float(dense_weight)
+        w_dense = max(0.0, min(1.0, w_dense))
+        w_bm25 = 1.0 - w_dense
+        return w_dense * dense_norm + w_bm25 * bm25_norm
         
     
     def save(self, retriever_cache_file: str, retriever_cache_embeddings_file: str):
@@ -696,9 +931,12 @@ class HybridRetriever:
             
         # 使用pickle保存其他所有内容
         state = {
+            'cache_version': RETRIEVER_CACHE_VERSION,
             'corpus': self.corpus,
+            'dense_corpus': self.dense_corpus,
             'document_ids': self.document_ids,
-            'model_name': 'BAAI/bge-m3'  # 模型名称的默认值
+            'model_name': 'BAAI/bge-m3',  # 模型名称的默认值
+            'dense_weight': self.dense_weight,
         }
         
         # 尝试获取实际的模型名称（如果可能）
@@ -706,6 +944,7 @@ class HybridRetriever:
             state['model_name'] = self.model.get_config_dict()['model_name']
         except (AttributeError, KeyError):
             pass
+        state['model_name'] = self.model_name
             
         with open(retriever_cache_file, 'wb') as f:
             pickle.dump(state, f)
@@ -725,61 +964,107 @@ class HybridRetriever:
         # 加载pickle序列化的状态
         with open(retriever_cache_file, 'rb') as f:
             state = pickle.load(f)
+        cache_version = state.get('cache_version', 0)
+        if cache_version != RETRIEVER_CACHE_VERSION:
+            raise ValueError(
+                f"Retriever cache version mismatch: expected {RETRIEVER_CACHE_VERSION}, got {cache_version}"
+            )
         
         # 使用默认值，防止缺少键的情况
         model_name = state.get('model_name', 'BAAI/bge-m3')
             
         # 创建新实例
-        retriever = cls(model_name=model_name)
+        dense_weight = state.get('dense_weight', 0.70)
+        retriever = cls(model_name=model_name, dense_weight=dense_weight)
         retriever.corpus = state.get('corpus', [])
+        retriever.dense_corpus = state.get('dense_corpus', list(retriever.corpus))
         retriever.document_ids = state.get('document_ids', {})
+        if len(retriever.dense_corpus) != len(retriever.corpus):
+            raise ValueError("Retriever cache is inconsistent: dense_corpus length mismatch")
         
         # 如果存在嵌入向量文件，则从numpy文件加载
         embeddings_path = Path(retriever_cache_embeddings_file)
         if embeddings_path.exists():
             retriever.embeddings = np.load(embeddings_path)
+
+        # 重新构建 BM25 索引，确保缓存加载后仍然是混合检索而非退化成纯 Dense
+        if retriever.corpus:
+            try:
+                from rank_bm25 import BM25Okapi
+                retriever.tokenized_corpus = [retriever._tokenize_for_bm25(doc) for doc in retriever.corpus]
+                retriever.bm25 = BM25Okapi(retriever.tokenized_corpus)
+            except Exception:
+                retriever.bm25 = None
+                retriever.tokenized_corpus = []
             
         return retriever
     
     @classmethod
-    def load_from_local_memory(cls, memories: Dict, model_name: str, 
-                              embeddings_cache_file: str = None) -> 'HybridRetriever':
+    def load_from_local_memory(cls, memories: Dict, model_name: str,
+                              dense_weight: float = 0.70,
+                              embeddings_cache_file: str = None,
+                              doc_texts: List[str] = None,
+                              dense_doc_texts: List[str] = None) -> 'HybridRetriever':
         """
         从内存中的记忆对象加载检索器状态
-        
+
         参数:
             memories: 记忆字典
             model_name: 使用的模型名称
             embeddings_cache_file: 可选的嵌入向量缓存文件路径，如果提供则复用已有嵌入向量
-            
+            doc_texts: 可选的文档文本列表，与 memories 顺序一致；
+                       传入后 BM25 索引将与 add_documents 路径保持一致
+
         返回:
             创建的检索器实例
         """
-        all_docs = [", ".join(m.keywords) for m in memories.values()] #[m.content for m in memories.values()]
-        retriever = cls(model_name)
+        if doc_texts is not None:
+            all_docs = doc_texts
+        else:
+            all_docs = [", ".join(m.keywords) for m in memories.values()]
+        if dense_doc_texts is not None:
+            all_dense_docs = dense_doc_texts
+        else:
+            all_dense_docs = list(all_docs)
+        if len(all_docs) != len(all_dense_docs):
+            raise ValueError("doc_texts and dense_doc_texts must have the same length")
+        retriever = cls(model_name, dense_weight=dense_weight)
         
         # 如果提供了嵌入向量缓存文件且文件存在，尝试加载
         if embeddings_cache_file and Path(embeddings_cache_file).exists():
             try:
                 cached_embeddings = np.load(embeddings_cache_file)
                 # 验证嵌入向量数量是否匹配
-                if len(cached_embeddings) == len(all_docs):
+                if len(cached_embeddings) == len(all_dense_docs):
                     retriever.corpus = all_docs
+                    retriever.dense_corpus = all_dense_docs
                     retriever.embeddings = cached_embeddings
                     retriever.document_ids = {doc: idx for idx, doc in enumerate(all_docs)}
+                    try:
+                        from rank_bm25 import BM25Okapi
+                        retriever.tokenized_corpus = [retriever._tokenize_for_bm25(doc) for doc in all_docs]
+                        retriever.bm25 = BM25Okapi(retriever.tokenized_corpus)
+                    except Exception:
+                        retriever.bm25 = None
+                        retriever.tokenized_corpus = []
                     
                     print(f"✓ 成功复用已有嵌入向量缓存")
                     return retriever
                 else:
-                    print(f"⚠ 嵌入向量数量不匹配（缓存: {len(cached_embeddings)}, 文档: {len(all_docs)}），将重新生成")
+                    print(f"⚠ 嵌入向量数量不匹配（缓存: {len(cached_embeddings)}, 文档: {len(all_dense_docs)}），将重新生成")
             except Exception as e:
                 print(f"⚠ 加载嵌入向量缓存失败: {e}，将重新生成")
         
         # 如果没有缓存或加载失败，使用原始方法
-        retriever.add_documents(all_docs)
+        retriever.add_documents(all_docs, dense_documents=all_dense_docs)
         return retriever
     
-    def add_documents(self, documents: List[str], batch_size: int = 32) -> bool:
+    def add_documents(
+        self,
+        documents: List[str],
+        dense_documents: Optional[List[str]] = None,
+        batch_size: int = 32,
+    ) -> bool:
         """
         一次性添加文档到语义索引中 (支持批量向量化)
         
@@ -792,14 +1077,25 @@ class HybridRetriever:
         """
         if not documents:
             return False
-            
-        # 过滤掉已存在的文档，防止嵌入向量和语料库错位
-        new_docs = [doc for doc in documents if doc not in self.document_ids]
-        if not new_docs:
+
+        if dense_documents is None:
+            dense_documents = documents
+        if len(documents) != len(dense_documents):
+            raise ValueError("documents and dense_documents must have the same length")
+
+        doc_pairs = [
+            (doc, dense_doc)
+            for doc, dense_doc in zip(documents, dense_documents)
+            if doc not in self.document_ids
+        ]
+        if not doc_pairs:
             return False
-            
+
+        new_docs = [doc for doc, _ in doc_pairs]
+        new_dense_docs = [dense_doc for _, dense_doc in doc_pairs]
+
         # 创建嵌入向量 (使用 batch_size 提速)
-        new_embeddings = self.model.encode(new_docs, batch_size=batch_size)
+        new_embeddings = self.model.encode(new_dense_docs, batch_size=batch_size)
         
         # 修复：确保 new_embeddings 是 numpy array 且为二维 (N, D)
         if hasattr(new_embeddings, 'numpy'):
@@ -812,27 +1108,27 @@ class HybridRetriever:
         else:
             self.embeddings = np.vstack([self.embeddings, new_embeddings])
             
-        # 维护 BM25
-        try:
-            from rank_bm25 import BM25Okapi
-            import jieba # 简单分词，如果仅限英文可以 split
-            for document in new_docs:
-                # 使用基础的按字/词切割
-                tokens = list(jieba.cut(document)) if 'jieba' in sys.modules else document.lower().split()
-                self.tokenized_corpus.append(tokens)
-            self.bm25 = BM25Okapi(self.tokenized_corpus)
-        except ImportError:
-            pass
-            
         doc_idx = len(self.corpus)
-        for document in new_docs:
+        for document, dense_document in zip(new_docs, new_dense_docs):
             self.corpus.append(document)
+            self.dense_corpus.append(dense_document)
             self.document_ids[document] = doc_idx
             doc_idx += 1
 
+        self._rebuild_bm25()
+
         return True
 
-    def add_document(self, document: str) -> bool:
+    def _rebuild_bm25(self) -> None:
+        try:
+            from rank_bm25 import BM25Okapi
+            self.tokenized_corpus = [self._tokenize_for_bm25(doc) for doc in self.corpus]
+            self.bm25 = BM25Okapi(self.tokenized_corpus) if self.tokenized_corpus else None
+        except Exception:
+            self.bm25 = None
+            self.tokenized_corpus = []
+
+    def add_document(self, document: str, dense_document: Optional[str] = None) -> bool:
         """
         向检索器添加单个文档
         
@@ -846,15 +1142,19 @@ class HybridRetriever:
         if document in self.document_ids:
             return False
             
+        if dense_document is None:
+            dense_document = document
+
         # 添加到语料库并获取索引
         doc_idx = len(self.corpus)
         self.corpus.append(document)
+        self.dense_corpus.append(dense_document)
         self.document_ids[document] = doc_idx
         
         # 更新嵌入向量
         # 修复：使用 numpy 进行拼接，避免 tensor 类型不匹配错误
         # 修复：将一维数组转换为二维数组 (1, D)
-        doc_embedding = self.model.encode([document])
+        doc_embedding = self.model.encode([dense_document])
         if hasattr(doc_embedding, 'numpy'): # If it's a tensor
             doc_embedding = doc_embedding.numpy()
         
@@ -867,15 +1167,7 @@ class HybridRetriever:
         else:
             self.embeddings = np.vstack([self.embeddings, doc_embedding])
             
-        # 维护 BM25
-        try:
-            from rank_bm25 import BM25Okapi
-            import jieba
-            tokens = list(jieba.cut(document)) if 'jieba' in sys.modules else document.lower().split()
-            self.tokenized_corpus.append(tokens)
-            self.bm25 = BM25Okapi(self.tokenized_corpus)
-        except ImportError:
-            pass
+        self._rebuild_bm25()
             
         return True
         
@@ -894,18 +1186,10 @@ class HybridRetriever:
         if not self.corpus:
             return ([] if not return_scores else ([], []))
         
-        # BM25 已弃用，始终走纯 Dense 语义路径
         if self.embeddings is None:
             return ([] if not return_scores else ([], []))
-            
-        query_embedding = self.model.encode([query])
-        # 防御性转换：确保是 NumPy 数组且为二维 (1, D)
-        if hasattr(query_embedding, 'numpy'):
-            query_embedding = query_embedding.numpy()
-        if len(query_embedding.shape) == 1:
-            query_embedding = query_embedding.reshape(1, -1)
-            
-        hybrid_scores = cosine_similarity(query_embedding, self.embeddings)[0]
+
+        hybrid_scores = self.get_hybrid_scores(query)
         
         # 获取前k个索引
         k = min(k, len(self.corpus))
@@ -947,6 +1231,20 @@ class HybridRetriever:
 
         return np.dot(embeddings_arr, query_embedding) / (norm_e * norm_q)
 
+    def get_dense_scores_normalized(self, query_embedding: np.ndarray) -> np.ndarray:
+        """返回 min-max 归一化的 Dense cosine 相似度分数。"""
+        raw = self.get_scores_by_emb(query_embedding)
+        if len(raw) == 0:
+            return np.array([])
+        return self._min_max_norm_array(raw)
+
+    def get_bm25_scores_normalized(self, query: str) -> np.ndarray:
+        """返回 min-max 归一化的 BM25 分数；BM25 不可用时返回全零。"""
+        if self.bm25 is None or not self.tokenized_corpus:
+            return np.zeros(len(self.corpus), dtype=float)
+        tokens = self._tokenize_for_bm25(query)
+        raw = np.asarray(self.bm25.get_scores(tokens), dtype=float)
+        return self._min_max_norm_array(raw)
 
 
 class AgenticDecomposer:
@@ -1131,6 +1429,8 @@ class AgenticMemorySystem:
     """
     def __init__(self, 
                  model_name: str = 'BAAI/bge-m3',
+                 reranker_model_name: str = 'BAAI/bge-reranker-v2-minicpm-layerwise',
+                 reranker_cutoff_layer: int = 28,
                  llm_backend: str = "openai",
                  llm_model: str = "gpt-4o-mini",
                  evo_threshold: int = 100,
@@ -1154,7 +1454,9 @@ class AgenticMemorySystem:
             use_reranking: 是否启用重排序（使用CrossEncoder提升检索精度）
         """
         self.memories = {}  # id -> MemoryNote
-        self.retriever = HybridRetriever(model_name)
+        # Dense 为主、BM25 为辅。对对话记忆闭集检索，0.70/0.30 通常比纯 Dense 更稳。
+        self.retriever_alpha = 0.70
+        self.retriever = HybridRetriever(model_name, dense_weight=self.retriever_alpha)
         self.llm_controller = LLMController(
             backend=llm_backend,
             model=llm_model,
@@ -1165,6 +1467,8 @@ class AgenticMemorySystem:
         )
         # 重排序相关
         self.use_reranking = use_reranking
+        self.reranker_model_name = reranker_model_name
+        self.reranker_cutoff_layer = int(reranker_cutoff_layer)
         self.reranker = None  # 延迟加载
         self.evolution_system_prompt = '''
                                 You are an AI memory evolution agent responsible for managing and evolving a knowledge base.
@@ -1256,12 +1560,8 @@ class AgenticMemorySystem:
             return all_memories[idx]
         return None
 
-    def _generate_doc_text(self, note: MemoryNote) -> str:
-        """生成包含 ID 的统一格式检索文本，保证唯一性，防止语料库去重跳过。
-
-        DATE 字段将时间戳（YYYYMMDDHHMI）转换为人类可读格式并写入文本，
-        使 BM25 关键词匹配能命中时间类查询（如 "May 2023"、"June 7"）。
-        """
+    def _generate_retrieval_text(self, note: MemoryNote) -> str:
+        """生成用于 BM25 / 图检索的富文本视图。"""
         date_str = ""
         if note.timestamp and len(note.timestamp) >= 8:
             try:
@@ -1272,6 +1572,14 @@ class AgenticMemorySystem:
                 date_str = note.timestamp[:8]
         date_field = f" DATE:{date_str}" if date_str else ""
         return f"ID:{note.id}{date_field} CONTENT:{note.content} CONTEXT:{note.context} KEYWORDS:{', '.join(note.keywords)} TAGS:{', '.join(note.tags)}"
+
+    def _generate_dense_text(self, note: MemoryNote) -> str:
+        """生成用于 dense embedding 的纯语义视图。"""
+        return note.content
+
+    def _generate_doc_text(self, note: MemoryNote) -> str:
+        """兼容旧调用，默认返回检索富文本视图。"""
+        return self._generate_retrieval_text(note)
 
     def add_notes_batch(self, contents: List[str], times: List[str] = None, **kwargs) -> List[str]:
         """
@@ -1292,29 +1600,41 @@ class AgenticMemorySystem:
             times = [None] * len(contents)
             
         note_ids = []
-        docs_to_add = []
+        retrieval_docs_to_add = []
+        dense_docs_to_add = []
+        new_notes: List[MemoryNote] = []
+        existing_notes_before_batch = list(self.memories.values())
         
         for content, time in zip(contents, times):
             note = MemoryNote(content=content, llm_controller=self.llm_controller, timestamp=time, **kwargs)
             evo_label, note = self.process_memory(note)
             self.memories[note.id] = note
             
-            doc_text = self._generate_doc_text(note)
-            docs_to_add.append(doc_text)
-            
-            # ── GraphRAG：构建图边 ─────────────────────
-            self._build_edges_for_new_note(note)
-            self.note_total_count += 1
-            self._graph_is_dirty = True
+            retrieval_docs_to_add.append(self._generate_retrieval_text(note))
+            dense_docs_to_add.append(self._generate_dense_text(note))
             
             note_ids.append(note.id)
+            new_notes.append(note)
             
             if evo_label == True:
                 self.evo_cnt += 1
                 
         # 批量进行 Embedding 并更新检索器
-        if docs_to_add:
-            self.retriever.add_documents(docs_to_add, batch_size=32)
+        if retrieval_docs_to_add:
+            self.retriever.add_documents(
+                retrieval_docs_to_add,
+                dense_documents=dense_docs_to_add,
+                batch_size=32,
+            )
+        edge_context_notes = list(existing_notes_before_batch)
+
+        # Batch 路径必须在 retriever 更新完成后再建图，
+        # 否则 semantic / BM25 边会基于错误或缺失的索引构建。
+        for note in new_notes:
+            self._build_edges_for_new_note(note, existing_notes=edge_context_notes)
+            edge_context_notes.append(note)
+            self.note_total_count += 1
+            self._graph_is_dirty = True
             
         if self.evo_cnt > 0 and self.evo_cnt % self.evo_threshold == 0:
             self.consolidate_memories()
@@ -1342,8 +1662,9 @@ class AgenticMemorySystem:
         # all_docs = [m.content for m in self.memories.values()]
         evo_label, note = self.process_memory(note)
         self.memories[note.id] = note
-        doc_text = self._generate_doc_text(note)
-        self.retriever.add_document(doc_text)
+        retrieval_text = self._generate_retrieval_text(note)
+        dense_text = self._generate_dense_text(note)
+        self.retriever.add_document(retrieval_text, dense_document=dense_text)
         if evo_label == True:
             self.evo_cnt += 1
             if self.evo_cnt % self.evo_threshold == 0:
@@ -1372,29 +1693,47 @@ class AgenticMemorySystem:
         # 使用相同的模型重置检索器
         try:
             # 尝试通过get_config_dict获取模型名称（如果可用）
-            model_name = self.retriever.model.get_config_dict()['model_name']
+            model_name = getattr(self.retriever, 'model_name', 'BAAI/bge-m3')
         except (AttributeError, KeyError):
             # 回退：使用类初始化时的模型名称
-            model_name = 'all-MiniLM-L6-v2'
+            model_name = 'BAAI/bge-m3'
         
-        self.retriever = HybridRetriever(model_name, alpha=self.retriever_alpha)
+        self.retriever = HybridRetriever(model_name, dense_weight=self.retriever_alpha)
         
         # 收集所有记忆文档并一次性添加
         all_docs = []
+        all_dense_docs = []
         for memory in self.memories.values():
             # 将记忆元数据合并为单个可搜索文档
-            doc_text = self._generate_doc_text(memory)
-            all_docs.append(doc_text)
+            all_docs.append(self._generate_retrieval_text(memory))
+            all_dense_docs.append(self._generate_dense_text(memory))
         
         # 一次性添加所有文档（HybridRetriever的add_documents会重新初始化索引）
         if all_docs:
-            self.retriever.add_documents(all_docs)
+            self.retriever.add_documents(all_docs, dense_documents=all_dense_docs)
+
+        self._rebuild_graph_edges()
 
         # ── GraphRAG：同步重建社区 ──────────────────────────────────────
         if len(self.memories) >= 5:
             self.rebuild_communities()
         # ────────────────────────────────────────────────────────────────
     
+    def _rebuild_graph_edges(self) -> None:
+        """基于当前 memories + retriever 状态全量重建图边。"""
+        self.graph_edges = []
+        ordered_notes = list(self.memories.values())
+        for note in ordered_notes:
+            note.id_based_links = []
+            note.community_id = None
+
+        existing_notes: List[MemoryNote] = []
+        for note in ordered_notes:
+            self._build_edges_for_new_note(note, existing_notes=existing_notes)
+            existing_notes.append(note)
+
+        self._graph_is_dirty = True
+
     def process_memory(self, note: MemoryNote) -> bool:
         """
         处理记忆笔记并返回演化标签
@@ -1522,7 +1861,8 @@ class AgenticMemorySystem:
                                 if target_note.id not in [link.get("id") if isinstance(link, dict) else link for link in note.links]:
                                     note.links.append({"id": target_note.id, "type": rel_type})
                                 
-                    note.tags = new_tags
+                    note.tags = new_tags or note.tags
+                    note.normalize_metadata()
                 elif action == "update_neighbor":
                     new_context_neighborhood = response_json["new_context_neighborhood"]
                     new_tags_neighborhood = response_json["new_tags_neighborhood"]
@@ -1541,29 +1881,29 @@ class AgenticMemorySystem:
                             context = notetmp.context
                             
                         # 向记忆添加标签
-                        notetmp.tags = tag
+                        notetmp.tags = tag or notetmp.tags
                         notetmp.context = context
+                        notetmp.normalize_metadata()
                         self.memories[notetmp.id] = notetmp
+        note.normalize_metadata()
         return should_evolve,note
 
     def _get_reranker(self):
         """
-        延迟加载重排序器（CrossEncoder）
-        
+        延迟加载重排序器
+
         返回:
-            CrossEncoder实例，如果不可用则返回None
+            具有 predict(pairs) 接口的重排序器实例，如果不可用则返回 None
         """
         if self.reranker is None and self.use_reranking:
             try:
-                from sentence_transformers import CrossEncoder
-                # 使用轻量级的交叉编码器模型
-                self.reranker = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
-                print("✓ 重排序器（CrossEncoder）已加载")
-            except ImportError:
-                print("⚠ Warning: CrossEncoder not available, reranking disabled")
-                self.use_reranking = False
+                self.reranker = load_reranker(
+                    self.reranker_model_name,
+                    cutoff_layer=self.reranker_cutoff_layer,
+                )
+                print(f"Loaded reranker: {self.reranker_model_name}")
             except Exception as e:
-                print(f"⚠ Warning: Failed to load reranker: {e}, reranking disabled")
+                print(f"Warning: Failed to load reranker {self.reranker_model_name}: {e}, reranking disabled")
                 self.use_reranking = False
         return self.reranker
 
@@ -1629,7 +1969,9 @@ class AgenticMemorySystem:
 
 
 
-    def agentic_retrieve(self, query: str, k: int = 5, max_verify_per_subquery: int = 8, include_community_context: bool = True) -> Union[str, Dict[str, Any]]:
+    def agentic_retrieve(self, query: str, k: int = 5, max_verify_per_subquery: int = 8,
+                         include_community_context: bool = True,
+                         dense_weight: Optional[float] = None) -> Union[str, Dict[str, Any]]:
         """
         基于 Agentic Decomposition 和 Reflection 的智能检索。
         将复杂问题分治后独立检索并过滤。
@@ -1653,7 +1995,12 @@ class AgenticMemorySystem:
             context_query = f"Intent: {core_intent} Sub-query: {sub_q}"
             
             # 使用升级版的超能漫游检索
-            advanced_result = self.find_related_memories_advanced(context_query, k=k, include_community_context=include_community_context)
+            advanced_result = self.find_related_memories_advanced(
+                context_query,
+                k=k,
+                include_community_context=include_community_context,
+                dense_weight=dense_weight,
+            )
             raw_memories = advanced_result.get("notes", [])
             
             if include_community_context:
@@ -1695,7 +2042,12 @@ class AgenticMemorySystem:
             missing_info = closure_check.get("missing_information", "")
             print(f"↻ Logical loop incomplete. Missing: {missing_info}. Triggering follow-up retrieval...")
             followup_query = f"Intent: {core_intent} Missing: {missing_info}"
-            followup_result = self.find_related_memories_advanced(followup_query, k=2, include_community_context=include_community_context)
+            followup_result = self.find_related_memories_advanced(
+                followup_query,
+                k=2,
+                include_community_context=include_community_context,
+                dense_weight=dense_weight,
+            )
             followup_memories = followup_result.get("notes", [])
             
             if include_community_context:
@@ -1719,8 +2071,8 @@ class AgenticMemorySystem:
             for cid in involved_communities:
                 if cid in self.communities:
                     cs = self.communities[cid]
-                    kws_str = ", ".join(cs.keywords[:5]) if cs.keywords else "无"
-                    community_context += f"【{cs.title}】{cs.summary} (涉及关键词: {kws_str})\n"
+                    kws_str = ", ".join(cs.keywords[:5]) if cs.keywords else "None"
+                    community_context += f"[{cs.title}] {cs.summary} (Keywords: {kws_str})\n"
             
             # 返回字典以匹配 _format_retrieval_context 的处理逻辑
             return {
@@ -1734,7 +2086,11 @@ class AgenticMemorySystem:
     # ██  GraphRAG 社区聚类方法（新增）
     # ══════════════════════════════════════════════════════════════════════
 
-    def _build_edges_for_new_note(self, note: MemoryNote) -> None:
+    def _build_edges_for_new_note(
+        self,
+        note: MemoryNote,
+        existing_notes: Optional[List[MemoryNote]] = None,
+    ) -> None:
         """
         为新加入的 note 自动构建三类图边：
           1. semantic  : 语义 cosine 相似度 ≥ edge_semantic_threshold
@@ -1746,15 +2102,20 @@ class AgenticMemorySystem:
         if not self.memories:
             return
 
-        # 获取新 note 的嵌入向量（直接用检索器已经 encode 过的最后一条）
-        # 由于 add_note 在调用此函数前已经 retriever.add_document，
-        # 最后一个嵌入就是新 note 的向量
         if self.retriever.embeddings is None or len(self.retriever.embeddings) == 0:
             return
+        new_doc_key = self._generate_doc_text(note)
 
-        new_emb = self.retriever.embeddings[-1].reshape(1, -1)   # shape (1, D)
+        # 始终通过文档 key 回查 embedding 行，避免 batch add_documents
+        # 时“最后一条 embedding 就是当前 note”这一假设失效。
+        new_idx = self.retriever.document_ids.get(new_doc_key)
+        if new_idx is None or new_idx >= len(self.retriever.embeddings):
+            return
 
-        existing_notes = list(self.memories.values())
+        new_emb = self.retriever.embeddings[new_idx].reshape(1, -1)   # shape (1, D)
+
+        if existing_notes is None:
+            existing_notes = list(self.memories.values())
         # 不包含刚加入的那条（self.memories 在此之前已写入）
         # 但 note 此时已在 self.memories 中，所以要排除自身
         existing_notes = [n for n in existing_notes if n.id != note.id]
@@ -2365,10 +2726,10 @@ Respond strictly in valid JSON format matching the required schema."""
         # Step 3: 格式化社区背景
         community_context = ""
         for cs in involved_communities:
-            kws_str = ", ".join(cs.keywords[:5]) if cs.keywords else "无"
+            kws_str = ", ".join(cs.keywords[:5]) if cs.keywords else "None"
             community_context += (
-                f"【{cs.title}】{cs.summary} "
-                f"(涉及关键词: {kws_str})\n"
+                f"[{cs.title}] {cs.summary} "
+                f"(Keywords: {kws_str})\n"
             )
 
         return {
@@ -2547,6 +2908,7 @@ Output JUST the hypothetical answer text, nothing else."""
         max_hops: int = 2,
         alpha: float = 0.5,
         use_hyde: bool = False,
+        dense_weight: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
         终极检索演进管道：Community Filter + BGE-M3 + PPR Walk
@@ -2574,8 +2936,12 @@ Output JUST the hypothetical answer text, nothing else."""
         # 稍微放宽 top_c 以减少漏网之鱼，并将硬过滤完全变为软过滤
         allowed_ids = self._community_filter(query_emb, top_c=3)
         
-        # 4. Dense 精搜种子节点
-        scores = self.retriever.get_scores_by_emb(query_emb[0])
+        # 4. Hybrid（Dense + BM25）精搜种子节点
+        scores = self.retriever.get_hybrid_scores(
+            query=query,
+            query_embedding=query_emb[0],
+            dense_weight=dense_weight,
+        )
         
         if len(scores) == 0:
             return {"notes": [], "community_context": "", "communities": []}
@@ -2642,9 +3008,20 @@ Output JUST the hypothetical answer text, nothing else."""
         final_list.sort(key=lambda x: x[1], reverse=True)
         
         # 限制最终注入给生成模型的证据条数，避免长上下文导致答案漂移
-        # 原来 k*2 在 k=24 时注入 32 条，对 qwen 系列小模型上下文过长反而导致答案漂移
         note_cap = min(k, 20)
-        related_notes = [x[0] for x in final_list[:note_cap]]
+        # 取 2x 候选送入 reranker 精排，再截断到 note_cap
+        candidate_notes = [x[0] for x in final_list[:note_cap * 2]]
+        reranker = self._get_reranker() if self.use_reranking else None
+        if reranker is not None and len(candidate_notes) > note_cap:
+            pairs = [[query, f"{n.content} {n.context}"] for n in candidate_notes]
+            try:
+                rr_scores = reranker.predict(pairs)
+                ranked = [candidate_notes[i] for i in np.argsort(rr_scores)[::-1]]
+                related_notes = ranked[:note_cap]
+            except Exception:
+                related_notes = candidate_notes[:note_cap]
+        else:
+            related_notes = candidate_notes[:note_cap]
         
         # 如果依然不够，回退填充
         if len(related_notes) < note_cap and seed_scores:
@@ -2666,17 +3043,913 @@ Output JUST the hypothetical answer text, nothing else."""
         community_context = ""
         if include_community_context:
             for cs in involved_communities:
-                kws_str = ", ".join(cs.keywords[:5]) if cs.keywords else "无"
+                kws_str = ", ".join(cs.keywords[:5]) if cs.keywords else "None"
                 community_context += (
-                    f"【{cs.title}】{cs.summary} "
-                    f"(涉及关键词: {kws_str})\n"
+                    f"[{cs.title}] {cs.summary} "
+                    f"(Keywords: {kws_str})\n"
                 )
+                # 注入最近演化历史，帮助 LLM 识别已更新/过期的信息
+                # 对 temporal-reasoning 和 knowledge-update 类问题有直接收益
+                if cs.evolution_history:
+                    for ev in cs.evolution_history[-2:]:
+                        removed_ids = ev.get("removed_note_ids", [])
+                        if removed_ids:
+                            snippets = []
+                            for nid in removed_ids[:3]:
+                                n = self.memories.get(nid)
+                                if n:
+                                    snippets.append(n.content[:80])
+                            if snippets:
+                                ts_short = ev.get("timestamp", "")[:8]
+                                community_context += (
+                                    f"  [知识更新@{ts_short}] 以下信息已被新内容替代: "
+                                    + " | ".join(snippets) + "\n"
+                                )
 
         return {
             "notes": related_notes,
             "community_context": community_context.strip(),
             "communities": involved_communities,
         }
+
+    # ══════════════════════════════════════════════════════════════════════
+    # ██  Multi-Channel Parallel Retrieval with RRF Fusion
+    # ══════════════════════════════════════════════════════════════════════
+
+    def retrieve_multi_channel_rrf(
+        self,
+        query: str,
+        k: int = 10,
+        program: Optional[EvidenceProgram] = None,
+        channel_weights: Optional[Dict[str, float]] = None,
+        k_rrf: int = 60,
+        enable_ppr: bool = False,
+        ppr_max_hops: int = 2,
+        ppr_damping: float = 0.8,
+        include_community_context: bool = True,
+        community_top_c: int = 5,
+    ) -> Dict[str, Any]:
+        """
+        多通道并行检索 + RRF 融合。
+
+        四个独立检索通道：
+          - Dense:     BGE-M3 cosine 语义检索
+          - BM25:      词汇级稀疏检索
+          - Community: 社区 embedding 匹配 → 成员展开 → 二次排序（创新通道）
+          - PPR:       图上个性化 PageRank 多跳漫游（可选）
+
+        通过 Reciprocal Rank Fusion 合并各通道排名，
+        channel_weights 控制各通道对最终得分的贡献。
+
+        返回值与 find_related_memories_advanced 兼容。
+        """
+        from collections import defaultdict
+
+        all_memories_list = list(self.memories.values())
+        if not all_memories_list:
+            return {"notes": [], "community_context": "", "communities": [],
+                    "rrf_scores": {}, "channel_details": {}}
+
+        default_weights = {"dense": 1.0, "bm25": 0.8, "community": 0.5, "ppr": 0.0}
+        weights = channel_weights or default_weights
+
+        # ── Step A: 编码 query（只做一次） ──────────────────────────
+        query_emb = self.retriever.model.encode([query])
+        if hasattr(query_emb, 'numpy'):
+            query_emb = query_emb.numpy()
+        query_emb_1d = query_emb[0] if len(query_emb.shape) == 2 else query_emb
+        query_emb_2d = query_emb_1d.reshape(1, -1)
+
+        dense_top_n = 50
+        bm25_top_n = 50
+        community_top_n = 30
+
+        # ── Step B: Channel 1 — Dense Retrieval ───────────────────
+        dense_ranked: List[Tuple[str, int]] = []
+        if weights.get("dense", 0) > 0:
+            dense_scores = self.retriever.get_scores_by_emb(query_emb_1d)
+            if len(dense_scores) > 0:
+                top_n = min(dense_top_n, len(dense_scores))
+                top_indices = np.argsort(dense_scores)[-top_n:][::-1]
+                rank = 1
+                for idx in top_indices:
+                    mem = self._get_note_by_doc_idx(idx)
+                    if mem:
+                        dense_ranked.append((mem.id, rank))
+                        rank += 1
+
+        # ── Step C: Channel 2 — BM25 Retrieval ────────────────────
+        bm25_ranked: List[Tuple[str, int]] = []
+        if weights.get("bm25", 0) > 0 and self.retriever.bm25 is not None:
+            query_tokens = self.retriever._tokenize_for_bm25(query)
+            bm25_scores = np.asarray(
+                self.retriever.bm25.get_scores(query_tokens), dtype=float
+            )
+            if len(bm25_scores) > 0:
+                top_n = min(bm25_top_n, len(bm25_scores))
+                top_indices = np.argsort(bm25_scores)[-top_n:][::-1]
+                rank = 1
+                for idx in top_indices:
+                    if bm25_scores[idx] <= 0:
+                        continue
+                    mem = self._get_note_by_doc_idx(idx)
+                    if mem:
+                        bm25_ranked.append((mem.id, rank))
+                        rank += 1
+
+        # ── Step D: Channel 3 — Community Retrieval（创新通道）─────
+        community_ranked: List[Tuple[str, int]] = []
+        if (weights.get("community", 0) > 0
+                and self.communities
+                and self.community_embeddings is not None
+                and community_top_c > 0):
+            comm_sims = cosine_similarity(query_emb_2d, self.community_embeddings)[0]
+            top_c = min(community_top_c, len(self.community_ids_list))
+            top_comm_indices = np.argsort(comm_sims)[-top_c:][::-1]
+
+            # 展开成员 note IDs（去重）
+            candidate_note_ids: List[str] = []
+            seen_ids: set = set()
+            for ci in top_comm_indices:
+                cid = self.community_ids_list[ci]
+                if cid in self.communities:
+                    for mid in self.communities[cid].member_note_ids:
+                        if mid not in seen_ids:
+                            seen_ids.add(mid)
+                            candidate_note_ids.append(mid)
+
+            # 按 dense 相似度对展开成员排序
+            member_scores: List[Tuple[str, float]] = []
+            for mid in candidate_note_ids:
+                if mid not in self.memories:
+                    continue
+                doc_text = self._generate_doc_text(self.memories[mid])
+                doc_idx = self.retriever.document_ids.get(doc_text)
+                if doc_idx is not None and doc_idx < len(self.retriever.embeddings):
+                    sim = float(cosine_similarity(
+                        query_emb_2d,
+                        self.retriever.embeddings[doc_idx].reshape(1, -1)
+                    )[0][0])
+                    member_scores.append((mid, sim))
+
+            member_scores.sort(key=lambda x: x[1], reverse=True)
+            for rank, (mid, _) in enumerate(member_scores[:community_top_n], 1):
+                community_ranked.append((mid, rank))
+
+        # ── Step E: Channel 4 — PPR Graph Walk（可选）──────────────
+        ppr_ranked: List[Tuple[str, int]] = []
+        if enable_ppr and weights.get("ppr", 0) > 0 and self.graph_edges:
+            seed_ids: set = set()
+            for ranked_list in [dense_ranked[:10], bm25_ranked[:10], community_ranked[:10]]:
+                for (nid, _) in ranked_list:
+                    seed_ids.add(nid)
+            if seed_ids:
+                ppr_results = self._ppr_walk(
+                    list(seed_ids), query=query,
+                    damping=ppr_damping, max_hops=max(0, int(ppr_max_hops)),
+                )
+                sorted_ppr = sorted(ppr_results.items(), key=lambda x: x[1], reverse=True)
+                for rank, (mid, _) in enumerate(sorted_ppr, 1):
+                    if mid in self.memories:
+                        ppr_ranked.append((mid, rank))
+
+        # ── Step F: RRF Fusion ─────────────────────────────────────
+        rrf_scores: Dict[str, float] = defaultdict(float)
+        channel_data = {
+            "dense": dense_ranked,
+            "bm25": bm25_ranked,
+            "community": community_ranked,
+            "ppr": ppr_ranked,
+        }
+        for channel_name, ranked_list in channel_data.items():
+            w = weights.get(channel_name, 0.0)
+            if w <= 0 or not ranked_list:
+                continue
+            for (note_id, rank) in ranked_list:
+                rrf_scores[note_id] += w / (k_rrf + rank)
+
+        sorted_fused = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
+        constraints = dict((program.metadata or {}).get("answer_constraints", {})) if program is not None else {}
+        if constraints and sorted_fused:
+            rerank_pool_size = min(len(sorted_fused), max(k * 4, 24))
+            reranked_pool = self._apply_constraint_rerank(
+                query,
+                sorted_fused[:rerank_pool_size],
+                constraints=constraints,
+            )
+            sorted_fused = reranked_pool + sorted_fused[rerank_pool_size:]
+
+        # ── Step G: Optional Reranking ──────────────────────────────
+        candidate_pool_size = min(len(sorted_fused), max(k * 3, 18))
+        candidate_ids = [mid for mid, _ in sorted_fused[:candidate_pool_size]]
+        candidate_notes = [self.memories[mid] for mid in candidate_ids if mid in self.memories]
+
+        reranker = self._get_reranker() if self.use_reranking else None
+        if reranker is not None and len(candidate_notes) > k:
+            pairs = [[query, f"{n.content} {n.context}"] for n in candidate_notes]
+            try:
+                rr_scores = reranker.predict(pairs)
+                ranked = [candidate_notes[i] for i in np.argsort(rr_scores)[::-1]]
+                related_notes = ranked[:k]
+            except Exception:
+                related_notes = candidate_notes[:k]
+        else:
+            related_notes = candidate_notes[:k]
+
+        # ── Step H: 社区上下文 ──────────────────────────────────────
+        involved_community_ids: set = set()
+        for note in related_notes:
+            if note.community_id and note.community_id in self.communities:
+                involved_community_ids.add(note.community_id)
+
+        community_context = ""
+        involved_communities: list = []
+        if include_community_context:
+            involved_communities = [self.communities[cid] for cid in involved_community_ids]
+            for cs in involved_communities:
+                kws_str = ", ".join(cs.keywords[:5]) if cs.keywords else "None"
+                community_context += (
+                    f"[{cs.title}] {cs.summary} "
+                    f"(Keywords: {kws_str})\n"
+                )
+                if cs.evolution_history:
+                    for ev in cs.evolution_history[-2:]:
+                        removed_ids = ev.get("removed_note_ids", [])
+                        if removed_ids:
+                            snippets = []
+                            for nid in removed_ids[:3]:
+                                n = self.memories.get(nid)
+                                if n:
+                                    snippets.append(n.content[:80])
+                            if snippets:
+                                ts_short = ev.get("timestamp", "")[:8]
+                                community_context += (
+                                    f"  [Knowledge Update @{ts_short}] Superseded: "
+                                    + " | ".join(snippets) + "\n"
+                                )
+
+        return {
+            "notes": related_notes,
+            "community_context": community_context.strip(),
+            "communities": involved_communities,
+            "rrf_scores": dict(rrf_scores),
+            "channel_details": {
+                "dense_ranked": dense_ranked,
+                "bm25_ranked": bm25_ranked,
+                "community_ranked": community_ranked,
+                "ppr_ranked": ppr_ranked,
+            },
+        }
+
+    # ══════════════════════════════════════════════════════════════════════
+    # ██  Multi-Channel RRF 结束
+    # ══════════════════════════════════════════════════════════════════════
+
+    def build_community_context_for_notes(
+        self,
+        notes: List[MemoryNote],
+        top_c: int = 5,
+    ) -> Dict[str, Any]:
+        involved_community_ids: List[str] = []
+        seen_ids = set()
+        for note in notes:
+            cid = getattr(note, "community_id", None)
+            if cid and cid in self.communities and cid not in seen_ids:
+                seen_ids.add(cid)
+                involved_community_ids.append(cid)
+
+        involved_community_ids = involved_community_ids[: max(0, int(top_c))]
+        involved_communities = [self.communities[cid] for cid in involved_community_ids if cid in self.communities]
+
+        community_context = ""
+        for cs in involved_communities:
+            kws_str = ", ".join(cs.keywords[:5]) if cs.keywords else "None"
+            community_context += (
+                f"[{cs.title}] {cs.summary} "
+                f"(Keywords: {kws_str})\n"
+            )
+            if cs.evolution_history:
+                for ev in cs.evolution_history[-2:]:
+                    removed_ids = ev.get("removed_note_ids", [])
+                    if not removed_ids:
+                        continue
+                    snippets = []
+                    for nid in removed_ids[:3]:
+                        note = self.memories.get(nid)
+                        if note:
+                            snippets.append(note.content[:80])
+                    if snippets:
+                        ts_short = ev.get("timestamp", "")[:8]
+                        community_context += (
+                            f"  [Knowledge Update @{ts_short}] Superseded: "
+                            + " | ".join(snippets) + "\n"
+                        )
+
+        return {
+            "community_context": community_context.strip(),
+            "communities": involved_communities,
+        }
+
+    def _program_query_terms(self, query: str) -> List[str]:
+        stopwords = {
+            "the", "a", "an", "and", "or", "to", "of", "in", "on", "for", "with", "at",
+            "by", "is", "are", "was", "were", "be", "been", "being", "did", "do", "does",
+            "what", "which", "who", "when", "where", "why", "how", "this", "that", "it",
+            "question", "conversation", "mentioned", "mention",
+        }
+        return [tok for tok in re.findall(r"[A-Za-z0-9_]+", (query or "").lower()) if tok not in stopwords]
+
+    def _score_note_for_program(self, query: str, note: MemoryNote, program: EvidenceProgram) -> float:
+        query_terms = set(self._program_query_terms(query))
+        note_text = " ".join(
+            [
+                note.content or "",
+                note.context or "",
+                " ".join(note.keywords or []),
+                " ".join(note.tags or []),
+            ]
+        ).lower()
+        note_terms = set(self._program_query_terms(note_text))
+        overlap = len(query_terms & note_terms)
+        constraints = dict((program.metadata or {}).get("answer_constraints", {}))
+
+        score = float(overlap)
+        if constraints:
+            named_entities = [str(name).lower() for name in constraints.get("named_entities", []) if str(name).strip()]
+            role_terms = [str(role).lower() for role in constraints.get("role_terms", []) if str(role).strip()]
+            entity_hits = sum(1 for name in named_entities if name in note_text)
+            role_hits = sum(1 for role in role_terms if role in note_text)
+            if entity_hits:
+                score += min(0.8, 0.35 * entity_hits)
+            elif constraints.get("entity_sensitive"):
+                score -= 0.2
+            if role_hits:
+                score += min(0.4, 0.2 * role_hits)
+            elif role_terms and constraints.get("entity_sensitive"):
+                score -= 0.1
+        if getattr(note, "timestamp", None) and program.program_type == ProgramType.TEMPORAL:
+            score += 0.8
+        if getattr(note, "community_id", None) and program.include_community_context:
+            score += 0.2
+        if program.program_type == ProgramType.MULTI_HOP and getattr(note, "id_based_links", None):
+            score += min(0.6, 0.15 * len(note.id_based_links))
+        if program.program_type == ProgramType.PROFILE and (note.context or "").lower() not in {"", "general"}:
+            score += 0.4
+        return score
+
+    def _dedupe_notes_by_id(self, notes: List[MemoryNote]) -> List[MemoryNote]:
+        deduped: List[MemoryNote] = []
+        seen_ids = set()
+        seen_content = set()
+        for note in notes:
+            if note is None:
+                continue
+            note_id = getattr(note, "id", None)
+            content = getattr(note, "content", None)
+            if note_id and note_id in seen_ids:
+                continue
+            if not note_id and content and content in seen_content:
+                continue
+            deduped.append(note)
+            if note_id:
+                seen_ids.add(note_id)
+            if content:
+                seen_content.add(content)
+        return deduped
+
+    def _note_text_for_program(self, note: MemoryNote) -> str:
+        return " ".join(
+            [
+                getattr(note, "content", "") or "",
+                getattr(note, "context", "") or "",
+                " ".join(getattr(note, "keywords", []) or []),
+                " ".join(getattr(note, "tags", []) or []),
+            ]
+        ).strip()
+
+    def _constraint_match_score(
+        self,
+        query: str,
+        note: MemoryNote,
+        constraints: Optional[Dict[str, Any]] = None,
+    ) -> float:
+        if note is None or not constraints:
+            return 0.0
+
+        note_text = self._note_text_for_program(note).lower()
+        if not note_text:
+            return 0.0
+
+        named_entities = [str(name).lower() for name in constraints.get("named_entities", []) if str(name).strip()]
+        role_terms = [str(role).lower() for role in constraints.get("role_terms", []) if str(role).strip()]
+        query_terms = set(self._program_query_terms(query))
+        note_terms = set(self._program_query_terms(note_text))
+
+        overlap = len(query_terms & note_terms)
+        entity_hits = sum(1 for name in named_entities if name in note_text)
+        role_hits = sum(1 for role in role_terms if role in note_text)
+
+        score = 0.0
+        if overlap:
+            score += min(0.9, 0.18 * overlap)
+        if entity_hits:
+            score += min(2.2, 0.85 * entity_hits)
+        elif constraints.get("entity_sensitive") and named_entities:
+            score -= 0.75
+        if role_hits:
+            score += min(1.0, 0.45 * role_hits)
+        elif constraints.get("entity_sensitive") and role_terms:
+            score -= 0.35
+
+        answer_type = str(constraints.get("answer_type", "") or "")
+        if answer_type == "location" and re.search(r"\b(from|in|at|near|to)\b", note_text):
+            score += 0.35
+        if answer_type == "count" and re.search(
+            r"\b\d+\b|\bonce\b|\btwice\b|\bthree\b|\bfour\b|\bfive\b|\bsix\b|\bseven\b|\beight\b|\bnine\b|\bten\b",
+            note_text,
+        ):
+            score += 0.35
+        if constraints.get("expects_list") and (", " in note_text or " and " in note_text):
+            score += 0.25
+        if answer_type == "reason_phrase" and re.search(
+            r"\b(because|since|due to|inspired by|motivated by|realized that|after)\b",
+            note_text,
+        ):
+            score += 0.3
+        return score
+
+    def _apply_constraint_rerank(
+        self,
+        query: str,
+        ranked_items: List[Tuple[str, float]],
+        constraints: Optional[Dict[str, Any]] = None,
+    ) -> List[Tuple[str, float]]:
+        if not constraints or not ranked_items:
+            return list(ranked_items)
+
+        rescored: List[Tuple[str, float, float]] = []
+        for note_id, base_score in ranked_items:
+            note = self.memories.get(note_id)
+            if note is None:
+                continue
+            adjusted_score = float(base_score) + 0.0045 * self._constraint_match_score(query, note, constraints)
+            rescored.append((note_id, adjusted_score, float(base_score)))
+
+        rescored.sort(key=lambda item: (item[1], item[2]), reverse=True)
+        return [(note_id, base_score) for note_id, _, base_score in rescored]
+
+    def _build_note_edge_index(
+        self,
+        notes: List[MemoryNote],
+        allowed_types: Optional[List[str]] = None,
+    ) -> Tuple[Dict[str, List[str]], Dict[Tuple[str, str], Dict[str, Any]]]:
+        note_ids = {
+            getattr(note, "id", None)
+            for note in notes
+            if getattr(note, "id", None)
+        }
+        if not note_ids or not self.graph_edges:
+            return {}, {}
+
+        allowed = set(
+            allowed_types
+            or [
+                "semantic",
+                "entity_shared",
+                "temporal_entity_evolution",
+                "causes",
+                "results_in",
+                "lexical_shared",
+                "temporal_adjacent",
+                "llm_inferred",
+            ]
+        )
+        adjacency_sets: Dict[str, set] = {}
+        edge_lookup: Dict[Tuple[str, str], Dict[str, Any]] = {}
+
+        for edge in self.graph_edges:
+            src_id = edge.get("src_id")
+            tgt_id = edge.get("tgt_id")
+            edge_type = str(edge.get("type", "semantic") or "semantic")
+            if not src_id or not tgt_id or src_id not in note_ids or tgt_id not in note_ids:
+                continue
+            if src_id not in self.memories or tgt_id not in self.memories:
+                continue
+            if allowed and edge_type not in allowed:
+                continue
+
+            weight = float(edge.get("weight", 0.0) or 0.0)
+            pair = tuple(sorted((src_id, tgt_id)))
+            best_edge = edge_lookup.get(pair)
+            if best_edge is None or weight > float(best_edge.get("weight", 0.0) or 0.0):
+                edge_lookup[pair] = {
+                    "src_id": src_id,
+                    "tgt_id": tgt_id,
+                    "weight": round(weight, 4),
+                    "type": edge_type,
+                }
+
+            adjacency_sets.setdefault(src_id, set()).add(tgt_id)
+            adjacency_sets.setdefault(tgt_id, set()).add(src_id)
+
+        adjacency = {
+            node_id: sorted(neighbors)
+            for node_id, neighbors in adjacency_sets.items()
+        }
+        return adjacency, edge_lookup
+
+    def _find_best_subgraph_path(
+        self,
+        seed_ids: List[str],
+        adjacency: Dict[str, List[str]],
+        note_scores: Dict[str, float],
+        max_hops: int,
+    ) -> List[str]:
+        if len(seed_ids) < 2:
+            return list(seed_ids)
+
+        start_id = seed_ids[0]
+        max_depth = max(1, int(max_hops or 0) + 1)
+        for target_id in seed_ids[1:]:
+            queue: List[Tuple[str, List[str], int]] = [(start_id, [start_id], 0)]
+            seen_depth: Dict[str, int] = {start_id: 0}
+            while queue:
+                current_id, path, depth = queue.pop(0)
+                if current_id == target_id:
+                    return path
+                if depth >= max_depth:
+                    continue
+
+                ranked_neighbors = sorted(
+                    adjacency.get(current_id, []),
+                    key=lambda node_id: (-note_scores.get(node_id, 0.0), node_id),
+                )
+                for neighbor_id in ranked_neighbors:
+                    next_depth = depth + 1
+                    if next_depth > max_depth:
+                        continue
+                    if neighbor_id in seen_depth and seen_depth[neighbor_id] <= next_depth:
+                        continue
+                    seen_depth[neighbor_id] = next_depth
+                    queue.append((neighbor_id, path + [neighbor_id], next_depth))
+        return []
+
+    def build_answer_subgraph(
+        self,
+        query: str,
+        notes: List[MemoryNote],
+        program: EvidenceProgram,
+    ) -> EvidenceSubgraph:
+        deduped = self._dedupe_notes_by_id(notes)
+        if not deduped:
+            return EvidenceSubgraph(metadata={"reason": "no_notes"})
+
+        query_terms = set(self._program_query_terms(query))
+        ranked_candidates: List[Tuple[MemoryNote, float, int]] = []
+        note_scores: Dict[str, float] = {}
+        note_terms: Dict[str, set] = {}
+        note_by_id: Dict[str, MemoryNote] = {}
+
+        for note in deduped:
+            note_id = getattr(note, "id", None)
+            if not note_id:
+                continue
+            terms = set(self._program_query_terms(self._note_text_for_program(note)))
+            overlap = len(query_terms & terms)
+            score = self._score_note_for_program(query, note, program) + min(1.2, 0.25 * overlap)
+            ranked_candidates.append((note, score, overlap))
+            note_scores[note_id] = score
+            note_terms[note_id] = terms
+            note_by_id[note_id] = note
+
+        if not ranked_candidates:
+            return EvidenceSubgraph(metadata={"reason": "no_note_ids"})
+
+        ranked_candidates.sort(key=lambda item: (item[2], item[1]), reverse=True)
+        seed_target = 2 if (
+            program.program_type == ProgramType.MULTI_HOP
+            or program.answer_style in {AnswerStyle.LIST_SPAN, AnswerStyle.SUMMARY_SHORT}
+        ) else 1
+        seed_ids: List[str] = []
+        for note, _, overlap in ranked_candidates:
+            note_id = getattr(note, "id", None)
+            if not note_id or note_id in seed_ids:
+                continue
+            if overlap > 0 or len(seed_ids) < seed_target:
+                seed_ids.append(note_id)
+            if len(seed_ids) >= seed_target:
+                break
+
+        adjacency, edge_lookup = self._build_note_edge_index(deduped)
+        selected_ids: List[str] = []
+        if program.program_type == ProgramType.MULTI_HOP:
+            if len(seed_ids) < 2:
+                return EvidenceSubgraph(
+                    seed_node_ids=seed_ids,
+                    metadata={"reason": "insufficient_seeds", "candidate_note_count": len(deduped)},
+                )
+            selected_ids = self._find_best_subgraph_path(seed_ids, adjacency, note_scores, program.max_hops)
+            if not selected_ids:
+                return EvidenceSubgraph(
+                    seed_node_ids=seed_ids,
+                    metadata={"reason": "no_connecting_path", "candidate_note_count": len(deduped)},
+                )
+        else:
+            if not seed_ids:
+                return EvidenceSubgraph(metadata={"reason": "no_seed"})
+            target_nodes = min(
+                max(1, int(program.max_notes or 1)),
+                3 if program.answer_style in {AnswerStyle.LIST_SPAN, AnswerStyle.SUMMARY_SHORT} else 2,
+            )
+            selected_ids = list(seed_ids[:target_nodes])
+            for neighbor_id in sorted(
+                adjacency.get(seed_ids[0], []),
+                key=lambda node_id: (-note_scores.get(node_id, 0.0), node_id),
+            ):
+                if neighbor_id in selected_ids:
+                    continue
+                if note_scores.get(neighbor_id, 0.0) <= 0.0:
+                    continue
+                selected_ids.append(neighbor_id)
+                if len(selected_ids) >= target_nodes:
+                    break
+
+        selected_ids = [node_id for node_id in selected_ids if node_id in note_by_id]
+        if not selected_ids or len(selected_ids) > max(1, int(program.max_notes or 1)):
+            return EvidenceSubgraph(
+                seed_node_ids=seed_ids,
+                metadata={"reason": "selection_out_of_budget", "candidate_note_count": len(deduped)},
+            )
+
+        selected_edges: List[Dict[str, Any]] = []
+        selected_edge_keys = set()
+        for idx in range(len(selected_ids) - 1):
+            pair = tuple(sorted((selected_ids[idx], selected_ids[idx + 1])))
+            edge = edge_lookup.get(pair)
+            if not edge or pair in selected_edge_keys:
+                continue
+            selected_edge_keys.add(pair)
+            selected_edges.append(dict(edge))
+
+        covered_terms = set()
+        for node_id in selected_ids:
+            covered_terms.update(query_terms & note_terms.get(node_id, set()))
+        query_coverage = (len(covered_terms) / max(len(query_terms), 1)) if query_terms else 0.0
+        avg_node_score = (
+            sum(note_scores.get(node_id, 0.0) for node_id in selected_ids) / max(len(selected_ids), 1)
+        )
+        avg_edge_weight = (
+            sum(float(edge.get("weight", 0.0) or 0.0) for edge in selected_edges) / max(len(selected_edges), 1)
+            if selected_edges else 0.0
+        )
+        bridge_node_ids = [node_id for node_id in selected_ids if node_id not in seed_ids]
+        connected = len(selected_ids) <= 1 or len(selected_edges) >= max(1, len(selected_ids) - 1)
+        confidence = 0.22
+        confidence += 0.34 * min(1.0, query_coverage)
+        confidence += 0.22 * min(1.0, avg_edge_weight)
+        confidence += 0.14 * min(1.0, avg_node_score / 4.0)
+        if bridge_node_ids:
+            confidence += 0.08
+        confidence = round(min(0.99, max(0.0, confidence)), 4)
+
+        valid = False
+        reason = "low_support"
+        top_overlap = max((len(query_terms & note_terms.get(node_id, set())) for node_id in selected_ids), default=0)
+        if program.program_type == ProgramType.MULTI_HOP:
+            valid = connected and len(selected_ids) >= 2 and bool(selected_edges) and query_coverage >= 0.12
+            reason = "multi_hop_path" if valid else "multi_hop_gate_failed"
+        elif program.program_type == ProgramType.VERIFY_UNSUPPORTED:
+            valid = query_coverage >= 0.34 or (top_overlap >= 2 and (bool(selected_edges) or len(selected_ids) == 1))
+            reason = "direct_support_cluster" if valid else "strict_support_gate_failed"
+        elif program.answer_style == AnswerStyle.LIST_SPAN:
+            valid = query_coverage >= 0.24 or (top_overlap >= 2 and len(selected_ids) >= 2)
+            reason = "list_support_cluster" if valid else "list_support_gate_failed"
+        elif program.answer_style == AnswerStyle.STRICT_ENTITY_SPAN:
+            valid = query_coverage >= 0.18 or top_overlap >= 2
+            reason = "strict_entity_cluster" if valid else "strict_entity_gate_failed"
+        elif program.answer_style in {AnswerStyle.SUMMARY_SHORT, AnswerStyle.REASON_PHRASE}:
+            valid = query_coverage >= 0.22 or (top_overlap >= 2 and len(selected_ids) >= 1)
+            reason = "summary_support_cluster" if valid else "summary_support_gate_failed"
+
+        metadata = {
+            "reason": reason,
+            "query_coverage": round(query_coverage, 4),
+            "avg_node_score": round(avg_node_score, 4),
+            "avg_edge_weight": round(avg_edge_weight, 4),
+            "connected": connected,
+            "path_length": len(selected_ids),
+            "candidate_note_count": len(deduped),
+        }
+        return EvidenceSubgraph(
+            nodes=[note_by_id[node_id] for node_id in selected_ids],
+            edges=selected_edges,
+            seed_node_ids=seed_ids,
+            bridge_node_ids=bridge_node_ids,
+            confidence=confidence,
+            valid=valid,
+            metadata=metadata,
+        )
+
+    def expand_evidence_graph(
+        self,
+        seed_notes: List[MemoryNote],
+        max_hops: int = 2,
+        edge_types: Optional[List[str]] = None,
+    ) -> List[MemoryNote]:
+        if not seed_notes or max_hops <= 0 or not self.graph_edges:
+            return self._dedupe_notes_by_id(seed_notes)
+
+        preferred_types = edge_types or [
+            "semantic",
+            "entity_shared",
+            "temporal_entity_evolution",
+            "causes",
+            "results_in",
+            "lexical_shared",
+        ]
+        allowed_types = set(preferred_types)
+        type_rank = {edge_type: idx for idx, edge_type in enumerate(preferred_types)}
+        adjacency: Dict[str, List[Tuple[int, float, str]]] = {}
+
+        for edge in self.graph_edges:
+            src_id = edge.get("src_id")
+            tgt_id = edge.get("tgt_id")
+            edge_type = edge.get("type", "semantic")
+            if edge_type not in allowed_types:
+                continue
+            weight = float(edge.get("weight", 0.0))
+            src_note = self.memories.get(src_id)
+            tgt_note = self.memories.get(tgt_id)
+            if src_note and tgt_note:
+                adjacency.setdefault(src_id, []).append((type_rank.get(edge_type, 99), -weight, tgt_id))
+                adjacency.setdefault(tgt_id, []).append((type_rank.get(edge_type, 99), -weight, src_id))
+
+        max_nodes = max(len(seed_notes), min(10, len(seed_notes) + max(0, max_hops) * 2))
+        ordered_notes = self._dedupe_notes_by_id(seed_notes)
+        visited = {note.id for note in ordered_notes if getattr(note, "id", None)}
+        frontier = [(note.id, 0) for note in ordered_notes if getattr(note, "id", None)]
+
+        while frontier and len(ordered_notes) < max_nodes:
+            current_id, hop = frontier.pop(0)
+            if hop >= max_hops:
+                continue
+            for _, _, neighbor_id in sorted(adjacency.get(current_id, [])):
+                if neighbor_id in visited:
+                    continue
+                neighbor_note = self.memories.get(neighbor_id)
+                if neighbor_note is None:
+                    continue
+                ordered_notes.append(neighbor_note)
+                visited.add(neighbor_id)
+                frontier.append((neighbor_id, hop + 1))
+                if len(ordered_notes) >= max_nodes:
+                    break
+
+        return self._dedupe_notes_by_id(ordered_notes)
+
+    def compress_to_minimal_evidence(
+        self,
+        query: str,
+        notes: List[MemoryNote],
+        program: EvidenceProgram,
+    ) -> List[MemoryNote]:
+        deduped = self._dedupe_notes_by_id(notes)
+        if len(deduped) <= program.max_notes:
+            return deduped
+
+        scored = [
+            (note, self._score_note_for_program(query, note, program))
+            for note in deduped
+        ]
+        scored.sort(key=lambda item: item[1], reverse=True)
+
+        if program.program_type != ProgramType.MULTI_HOP:
+            return [note for note, _ in scored[: program.max_notes]]
+
+        selected: List[MemoryNote] = []
+        selected_ids = set()
+        while scored and len(selected) < program.max_notes:
+            best_idx = 0
+            best_value = None
+            for idx, (note, base_score) in enumerate(scored):
+                note_id = getattr(note, "id", None)
+                link_bonus = 0.0
+                if selected and note_id:
+                    for chosen in selected:
+                        chosen_links = set(getattr(chosen, "id_based_links", []) or [])
+                        if note_id in chosen_links or getattr(chosen, "id", None) in (getattr(note, "id_based_links", []) or []):
+                            link_bonus = 0.8
+                            break
+                value = base_score + link_bonus
+                if best_value is None or value > best_value:
+                    best_value = value
+                    best_idx = idx
+            note, _ = scored.pop(best_idx)
+            note_id = getattr(note, "id", None)
+            if note_id and note_id in selected_ids:
+                continue
+            selected.append(note)
+            if note_id:
+                selected_ids.add(note_id)
+
+        return self._dedupe_notes_by_id(selected[: program.max_notes])
+
+    def execute_evidence_program(
+        self,
+        program: EvidenceProgram,
+        query: str,
+        k: int = 10,
+    ) -> RetrievalResult:
+        trace = ExecutionTrace(metadata={"program": program.to_dict()})
+        effective_k = max(1, min(int(k or program.k), max(program.k, k or program.k)))
+        retrieval_engine = program.retrieval_engine
+
+        if retrieval_engine == RetrievalEngine.DIRECT_HYBRID:
+            notes = self.find_related_memories(query, k=effective_k)
+            trace.add_step("retrieve_direct_hybrid", note_count=len(notes), k=effective_k)
+            result = RetrievalResult(
+                notes=notes,
+                community_context="",
+                communities=[],
+                program_type=program.program_type.value,
+                retrieval_engine=retrieval_engine.value,
+            )
+        elif retrieval_engine == RetrievalEngine.RRF_MULTI_CHANNEL:
+            payload = self.retrieve_multi_channel_rrf(
+                query=query,
+                k=effective_k,
+                program=program,
+                channel_weights=program.channel_weights,
+                enable_ppr=program.enable_ppr,
+                ppr_max_hops=program.max_hops,
+                ppr_damping=0.8,
+                include_community_context=program.include_community_context,
+                community_top_c=program.community_top_c,
+            )
+            trace.add_step(
+                "retrieve_rrf",
+                note_count=len(payload.get("notes", [])),
+                enable_ppr=program.enable_ppr,
+                max_hops=program.max_hops,
+            )
+            result = RetrievalResult.from_payload(
+                payload,
+                retrieval_engine=retrieval_engine.value,
+                program_type=program.program_type.value,
+            )
+        elif retrieval_engine == RetrievalEngine.AGENTIC:
+            payload = self.agentic_retrieve(
+                query,
+                k=effective_k,
+                max_verify_per_subquery=min(max(effective_k, 8), 24),
+                include_community_context=program.include_community_context,
+                dense_weight=program.dense_weight,
+            )
+            trace.add_step("retrieve_agentic", max_verify_per_subquery=min(max(effective_k, 8), 24))
+            result = RetrievalResult.from_payload(
+                payload,
+                retrieval_engine=retrieval_engine.value,
+                program_type=program.program_type.value,
+            )
+        else:
+            payload = self.find_related_memories_advanced(
+                query,
+                k=effective_k,
+                include_community_context=program.include_community_context,
+                max_hops=program.max_hops,
+                alpha=program.fusion_alpha,
+                dense_weight=program.dense_weight,
+            )
+            trace.add_step("retrieve_advanced", note_count=len(payload.get("notes", [])), max_hops=program.max_hops)
+            result = RetrievalResult.from_payload(
+                payload,
+                retrieval_engine=RetrievalEngine.GRAPH_ADVANCED.value,
+                program_type=program.program_type.value,
+            )
+
+        notes = self._dedupe_notes_by_id(result.notes)
+        if program.program_type == ProgramType.MULTI_HOP:
+            expanded_notes = self.expand_evidence_graph(notes, max_hops=program.max_hops)
+            trace.add_step(
+                "expand_graph",
+                seed_count=len(notes),
+                expanded_count=max(0, len(expanded_notes) - len(notes)),
+                edge_hops=program.max_hops,
+            )
+            notes = self._dedupe_notes_by_id(expanded_notes)
+
+        if program.include_community_context:
+            community_payload = self.build_community_context_for_notes(notes, top_c=program.community_top_c)
+        else:
+            community_payload = {"community_context": "", "communities": []}
+
+        result.notes = notes
+        result.community_context = community_payload.get("community_context", "")
+        result.communities = community_payload.get("communities", [])
+        result.execution_trace = trace.to_dict()
+        result.program_type = program.program_type.value
+        result.retrieval_engine = retrieval_engine.value
+        return result
 
     def save_graph(self, save_dir: str) -> None:
         """
@@ -2708,7 +3981,13 @@ Output JUST the hypothetical answer text, nothing else."""
         # 保存 community_ids_list
         meta_path = Path(save_dir) / "graph_meta.json"
         with open(meta_path, "w", encoding="utf-8") as f:
-            json.dump({"community_ids_list": self.community_ids_list}, f)
+            json.dump(
+                {
+                    "community_ids_list": self.community_ids_list,
+                    "graph_cache_version": GRAPH_CACHE_VERSION,
+                },
+                f,
+            )
 
         print(f"✅ GraphRAG 状态已保存到 {save_dir}")
 
@@ -2750,6 +4029,11 @@ Output JUST the hypothetical answer text, nothing else."""
         if meta_path.exists():
             with open(meta_path, "r", encoding="utf-8") as f:
                 meta = json.load(f)
+            graph_cache_version = meta.get("graph_cache_version", 0)
+            if graph_cache_version != GRAPH_CACHE_VERSION:
+                raise ValueError(
+                    f"Graph cache version mismatch: expected {GRAPH_CACHE_VERSION}, got {graph_cache_version}"
+                )
             self.community_ids_list = meta.get("community_ids_list", [])
             
             # 将 numpy array 形式的 embedding 分配回对应的 CommunitySummary

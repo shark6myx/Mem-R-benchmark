@@ -13,6 +13,7 @@ from sentence_transformers import SentenceTransformer
 import logging
 from dataclasses import dataclass
 from pathlib import Path
+from model_cache_utils import load_sentence_transformer
 from openai import OpenAI
 from load_dataset import load_locomo_dataset, QA, Turn, Session, Conversation
 from sentence_transformers.util import pytorch_cos_sim
@@ -24,14 +25,10 @@ try:
 except Exception as e:
     print(f"Error downloading NLTK data: {e}")
 
-import os
-# Configure HuggingFace to use domestic mirror BEFORE importing SentenceTransformer
-os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
-
 # Initialize SentenceTransformer model (this will be reused)
 try:
     # 第一次运行如果本地没有模型，会自动从 hf-mirror.com 下载 BAAI/bge-m3 到 ~/.cache/huggingface/hub/
-    sentence_model = SentenceTransformer('BAAI/bge-m3')
+    sentence_model = load_sentence_transformer('BAAI/bge-m3')
 except Exception as e:
     print(f"Warning: Could not load SentenceTransformer model: {e}")
     sentence_model = None
